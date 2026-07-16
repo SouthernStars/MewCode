@@ -92,7 +92,13 @@ class HookEngine:
                     "Hook '%s' action failed: %s", hook.id, result.output
                 )
         except Exception as e:
-            log.warning("Hook '%s' execution error: %s", hook.id, e)
+            log.error(
+                "Hook execution failed: hook_id=%s event=%s reason=%s",
+                hook.id,
+                hook.event,
+                e,
+                exc_info=True,
+            )
             self._notifications.append(
                 HookNotification(
                     hook_id=hook.id,
@@ -126,7 +132,13 @@ class HookEngine:
                         hook_id=hook.id,
                     )
             except Exception as e:
-                log.warning("Hook '%s' execution error: %s", hook.id, e)
+                log.error(
+                    "Pre-tool hook failed: hook_id=%s tool=%s reason=%s",
+                    hook.id,
+                    ctx.tool_name,
+                    e,
+                    exc_info=True,
+                )
         return None
 
     def get_prompt_messages(self) -> list[str]:

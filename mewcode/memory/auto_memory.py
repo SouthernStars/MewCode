@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from mewcode.conversation import ConversationManager, Message
+
+log = logging.getLogger(__name__)
 
 USER_MEMORIES_RELPATH = ".mewcode/memories.md"
 PROJECT_MEMORIES_RELPATH = ".mewcode/memories.md"
@@ -136,7 +139,16 @@ class MemoryManager:
                     collected += event.text
                 elif isinstance(event, StreamEnd):
                     pass
-        except Exception:
+        except Exception as exc:
+            log.error(
+                "Automatic memory extraction failed: project=%s "
+                "messages=%d protocol=%s reason=%s",
+                self._project_path.parent.parent,
+                len(recent),
+                protocol,
+                exc,
+                exc_info=True,
+            )
             return
 
         self._last_extraction_msg_count = len(conversation.history)

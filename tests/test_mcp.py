@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import textwrap
 import tempfile
@@ -20,6 +21,7 @@ from mewcode.config import (
     load_config,
     resolve_env_vars,
 )
+from mewcode.mcp.manager import MCPManager
 
 # ===========================================================================
 # resolve_env_vars
@@ -169,6 +171,21 @@ class TestLoadConfigMCP:
 # ===========================================================================
 # MCPToolWrapper
 # ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_manager_shutdown_logs_client_close_failure(caplog) -> None:
+    manager = MCPManager()
+    client = AsyncMock()
+    client.close.side_effect = RuntimeError("close failed")
+    manager._clients["broken-server"] = client
+
+    with caplog.at_level(logging.ERROR):
+        await manager.shutdown()
+
+    assert "broken-server" in caplog.text
+    assert "close failed" in caplog.text
+    assert manager._clients == {}
 
 class TestMCPToolWrapper:
     def test_name_format(self) -> None:

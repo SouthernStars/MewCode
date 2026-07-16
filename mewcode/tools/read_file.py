@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -10,6 +11,8 @@ from mewcode.tools.base import Tool, ToolResult
 if TYPE_CHECKING:
     from mewcode.cache import FileCache
     from mewcode.tools.file_state_cache import FileStateCache
+
+log = logging.getLogger(__name__)
 
 
 class Params(BaseModel):
@@ -46,15 +49,27 @@ class ReadFile(Tool):
                 text = path.read_text(encoding="utf-8")
                 if self._cache:
                     self._cache.put(resolved, text)
-        except Exception as e:
-            return ToolResult(output=f"Error reading file: {e}", is_error=True)
+        except Exception as exc:
+            log.error(
+                "ReadFile failed: path=%s resolved_path=%s reason=%s",
+                params.file_path,
+                resolved,
+                exc,
+                exc_info=True,
+            )
+            return ToolResult(output=f"Error reading file: {exc}", is_error=True)
 
         if self._state_cache:
             try:
                 mtime_ns = path.stat().st_mtime_ns
                 self._state_cache.record(resolved, text, mtime_ns)
-            except OSError:
-                pass
+            except OSError as exc:
+                log.error(
+                    "ReadFile state cache update failed: path=%s reason=%s",
+                    resolved,
+                    exc,
+                    exc_info=True,
+                )
 
         lines = text.splitlines()
         selected = lines[params.offset : params.offset + params.limit]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -646,6 +647,36 @@ class TestMemoryManager:
         assert "uses PostgreSQL" in project_content
         assert "docs at example.com" in project_content
         assert "use spaces" not in project_content
+
+    @pytest.mark.asyncio
+    async def test_extract_failure_is_logged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog,
+    ) -> None:
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+        manager = MemoryManager(str(tmp_path / "project"))
+        conversation = ConversationManager()
+        conversation.add_user_message("remember this")
+
+        class FailingClient:
+            async def stream(self, conversation, system="", tools=None):
+                raise RuntimeError("memory provider failed")
+                if False:
+                    yield None
+
+        with caplog.at_level(logging.ERROR):
+            await manager.extract(
+                FailingClient(),
+                conversation,
+                "anthropic",
+            )
+
+        assert "memory provider failed" in caplog.text
+        assert str(tmp_path / "project") in caplog.text
 
 # =========================================================================
 # H. 会话注入长期记忆 inject_long_term_memory

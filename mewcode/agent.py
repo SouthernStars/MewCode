@@ -616,8 +616,13 @@ class Agent:
                                 )
                                 # 不 break — 让 Agent 继续处理建议
                                 continue
-                    except Exception as e:
-                        log.debug("Critic check failed: %s", e)
+                    except Exception as exc:
+                        log.error(
+                            "Critic check failed: agent_id=%s reason=%s",
+                            self.agent_id,
+                            exc,
+                            exc_info=True,
+                        )
 
                 if (
                     self._loop_count % MEMORY_EXTRACTION_INTERVAL == 0
@@ -772,8 +777,14 @@ class Agent:
                     prefix = f"[{msg.message_type} from {msg.from_agent}]"
                 content = f"{prefix} {msg.content}"
                 conversation.add_user_message(content)
-        except Exception as e:
-            log.debug("Mailbox consumption failed: %s", e)
+        except Exception as exc:
+            log.error(
+                "Mailbox consumption failed: agent_id=%s team=%s reason=%s",
+                self.agent_id,
+                self.team_name,
+                exc,
+                exc_info=True,
+            )
 
     def _build_permission_description(self, tc: ToolCallComplete) -> str:
         if tc.tool_name == "Bash":
@@ -935,6 +946,16 @@ class Agent:
                 is_error=True,
             )
         except Exception as exc:
+            log.error(
+                "Tool execution failed: agent_id=%s session_id=%s tool=%s "
+                "tool_call_id=%s reason=%s",
+                self.agent_id,
+                self.session_id,
+                tc.tool_name,
+                tc.tool_id,
+                exc,
+                exc_info=True,
+            )
             result = ToolResult(
                 output=f"Tool execution error: {exc}",
                 is_error=True,
@@ -1004,7 +1025,16 @@ class Agent:
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
-        except OSError:
+        except OSError as exc:
+            log.error(
+                "Recovery snapshot read failed: agent_id=%s session_id=%s "
+                "path=%s reason=%s",
+                self.agent_id,
+                self.session_id,
+                path,
+                exc,
+                exc_info=True,
+            )
             return
         self.recovery_state.record_file_read(path, content)
 
@@ -1018,8 +1048,15 @@ class Agent:
             await self.memory_manager.extract(
                 self.client, conversation, self.protocol
             )
-        except Exception as e:
-            log.debug("Memory extraction failed: %s", e)
+        except Exception as exc:
+            log.error(
+                "Agent memory extraction failed: agent_id=%s session_id=%s "
+                "reason=%s",
+                self.agent_id,
+                self.session_id,
+                exc,
+                exc_info=True,
+            )
         finally:
             self._extracting = False
 

@@ -39,7 +39,7 @@ class MCPManager:
 
             except Exception as e:
                 msg = f"MCP server '{name}': {e}"
-                logger.warning(msg)
+                logger.error(msg, exc_info=True)
                 errors.append(msg)
 
         return errors
@@ -71,6 +71,11 @@ class MCPManager:
             try:
                 await client.close()
                 logger.info("MCP server '%s' closed", name)
-            except Exception:
-                logger.debug("Error closing MCP server '%s'", name, exc_info=True)
+            except Exception as exc:
+                logger.error(
+                    "Failed to close MCP server: name=%s reason=%s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
         self._clients.clear()

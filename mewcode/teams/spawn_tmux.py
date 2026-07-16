@@ -111,12 +111,22 @@ def spawn_tmux_teammate(
 def send_keys_to_pane(pane_id: str, keys: str = "") -> None:
     try:
         _run_tmux("send-keys", "-t", pane_id, keys, "Enter")
-    except TmuxSpawnError:
-        log.warning("Failed to send keys to tmux pane %s", pane_id)
+    except TmuxSpawnError as exc:
+        log.error(
+            "Failed to send keys to tmux pane: pane_id=%s reason=%s",
+            pane_id,
+            exc,
+            exc_info=True,
+        )
 
 
 def kill_pane(pane_id: str) -> None:
     try:
         _run_tmux("kill-pane", "-t", pane_id)
-    except TmuxSpawnError:
-        pass
+    except TmuxSpawnError as exc:
+        log.error(
+            "Failed to kill tmux pane: pane_id=%s reason=%s",
+            pane_id,
+            exc,
+            exc_info=True,
+        )

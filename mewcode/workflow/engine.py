@@ -95,7 +95,13 @@ class WorkflowEngine:
 
         try:
             source = py_file.read_text(encoding="utf-8")
-        except Exception:
+        except OSError as exc:
+            log.error(
+                "Workflow metadata read failed: path=%s reason=%s",
+                py_file,
+                exc,
+                exc_info=True,
+            )
             return WorkflowDef(
                 name=name,
                 description=description,
@@ -126,8 +132,13 @@ class WorkflowEngine:
                                             name = str(val.value)
                                         elif key.value == "description":
                                             description = str(val.value)
-        except SyntaxError:
-            pass
+        except SyntaxError as exc:
+            log.error(
+                "Workflow metadata parse failed: path=%s reason=%s",
+                py_file,
+                exc,
+                exc_info=True,
+            )
 
         # 回退到 __doc__
         if not description:

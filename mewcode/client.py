@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
 
@@ -24,6 +25,8 @@ from mewcode.tools.base import (
     ToolCallDelta,
     ToolCallStart,
 )
+
+log = logging.getLogger(__name__)
 
 
 # 限制自动拉取模型元数据的超时时间，防止慢响应或挂起的
@@ -155,7 +158,13 @@ class AnthropicClient(LLMClient):
             if isinstance(window, int) and window > 0:
                 return window
             return None
-        except Exception:
+        except Exception as exc:
+            log.error(
+                "Anthropic context-window lookup failed: model=%s reason=%s",
+                self.model,
+                exc,
+                exc_info=True,
+            )
             return None
 
     async def stream(
@@ -587,7 +596,16 @@ async def resolve_context_window(config: ProviderConfig) -> None:
 
     try:
         client = create_client(config)
-    except Exception:
+    except Exception as exc:
+        log.error(
+            "Context-window client creation failed: provider=%s model=%s "
+            "protocol=%s reason=%s",
+            config.name,
+            config.model,
+            config.protocol,
+            exc,
+            exc_info=True,
+        )
         return
     fetch = getattr(client, "fetch_model_context_window", None)
     if fetch is None:
@@ -595,7 +613,16 @@ async def resolve_context_window(config: ProviderConfig) -> None:
 
     try:
         window = await fetch()
-    except Exception:
+    except Exception as exc:
+        log.error(
+            "Context-window fetch failed: provider=%s model=%s protocol=%s "
+            "reason=%s",
+            config.name,
+            config.model,
+            config.protocol,
+            exc,
+            exc_info=True,
+        )
         window = None
     if window:
         config.set_fetched_context_window(window)
