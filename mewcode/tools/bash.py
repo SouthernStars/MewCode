@@ -6,11 +6,13 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from mewcode.tools.base import MAX_OUTPUT_CHARS, Tool, ToolResult
+from mewcode.tools.windows_job import WindowsJob
 
 MAX_TIMEOUT = 600
 _READ_CHUNK_BYTES = 8192
@@ -53,12 +55,17 @@ async def _read_stream_limited(
 
 async def _terminate_process_tree(
     proc: asyncio.subprocess.Process,
+    windows_job: WindowsJob | None,
 ) -> None:
     if proc.returncode is not None:
+        if windows_job is not None:
+            windows_job.close()
         return
 
     try:
-        if os.name == "nt":
+        if windows_job is not None:
+            windows_job.close()
+        elif os.name == "nt":
             os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
             await asyncio.sleep(0.2)
             if proc.returncode is None:
@@ -176,8 +183,12 @@ class Bash(Tool):
             creation_options["start_new_session"] = True
 
         try:
-            proc = await asyncio.create_subprocess_shell(
+            runner_path = Path(__file__).with_name("command_runner.py")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(runner_path),
                 params.command,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self._work_dir),
@@ -195,19 +206,32 @@ class Bash(Tool):
                 is_error=True,
             )
 
+        windows_job = WindowsJob.attach(proc)
+        try:
+            if proc.stdin is None:
+                raise RuntimeError(
+                    f"Command runner stdin was not created: pid={proc.pid}"
+                )
+            proc.stdin.write(b"1")
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except BaseException:
+            await _terminate_process_tree(proc, windows_job)
+            raise
+
         stdout_task = asyncio.create_task(_read_stream_limited(proc.stdout))
         stderr_task = asyncio.create_task(_read_stream_limited(proc.stderr))
         try:
             await asyncio.wait_for(proc.wait(), timeout=params.timeout)
         except asyncio.TimeoutError:
-            await _terminate_process_tree(proc)
+            await _terminate_process_tree(proc, windows_job)
             await _cancel_readers(stdout_task, stderr_task)
             return ToolResult(
                 output=f"Error: command timed out after {params.timeout}s",
                 is_error=True,
             )
         except asyncio.CancelledError:
-            await _terminate_process_tree(proc)
+            await _terminate_process_tree(proc, windows_job)
             await _cancel_readers(stdout_task, stderr_task)
             raise
 
@@ -219,5 +243,7 @@ class Bash(Tool):
             stderr,
             truncated=stdout_truncated or stderr_truncated,
         )
+        if windows_job is not None:
+            windows_job.close()
         return ToolResult(output=output, is_error=proc.returncode != 0)
 
