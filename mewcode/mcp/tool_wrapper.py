@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from mcp import types as mcp_types
@@ -7,6 +9,10 @@ from pydantic import BaseModel, create_model
 
 from mewcode.mcp.client import MCPClient
 from mewcode.tools.base import Tool, ToolResult
+
+MCP_TOOL_TIMEOUT_SECONDS = 60
+
+log = logging.getLogger(__name__)
 
 
 def _build_params_model(
@@ -55,6 +61,8 @@ def _extract_text(content: list[Any]) -> str:
 
 
 class MCPToolWrapper(Tool):
+    execution_timeout = MCP_TOOL_TIMEOUT_SECONDS
+
     def __init__(
         self,
         server_name: str,
@@ -90,9 +98,16 @@ class MCPToolWrapper(Tool):
         if not self._client.is_alive:
             try:
                 await self._client.connect()
-            except Exception as e:
+            except Exception as exc:
+                log.error(
+                    "MCP reconnect failed: server=%s tool=%s reason=%s",
+                    self._server_name,
+                    self._tool_def.name,
+                    exc,
+                    exc_info=True,
+                )
                 return ToolResult(
-                    output=f"MCP server '{self._server_name}' reconnect failed: {e}",
+                    output=f"MCP server '{self._server_name}' reconnect failed: {exc}",
                     is_error=True,
                 )
 
@@ -100,10 +115,20 @@ class MCPToolWrapper(Tool):
             result = await self._client.call_tool(
                 self._tool_def.name, params.model_dump(exclude_none=True)
             )
-        except Exception as e:
+        except asyncio.CancelledError:
             self._client._alive = False
+            raise
+        except Exception as exc:
+            self._client._alive = False
+            log.error(
+                "MCP tool call failed: server=%s tool=%s reason=%s",
+                self._server_name,
+                self._tool_def.name,
+                exc,
+                exc_info=True,
+            )
             return ToolResult(
-                output=f"MCP tool call failed: {e}",
+                output=f"MCP tool call failed: {exc}",
                 is_error=True,
             )
 

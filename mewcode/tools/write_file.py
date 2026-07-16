@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import copy
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
+from mewcode.permissions.sandbox import PathSandbox
 from mewcode.tools.base import Tool, ToolResult
+from mewcode.tools.path_utils import resolve_tool_path
 
 if TYPE_CHECKING:
     from mewcode.cache import FileCache
     from mewcode.tools.file_state_cache import FileStateCache
+
+log = logging.getLogger(__name__)
 
 
 class Params(BaseModel):
@@ -27,17 +33,35 @@ class WriteFile(Tool):
     category = "write"
 
 
-    def __init__(self, file_cache: FileCache | None = None, file_history: Any = None, file_state_cache: FileStateCache | None = None) -> None:
+    def __init__(
+        self,
+        file_cache: FileCache | None = None,
+        file_history: Any = None,
+        file_state_cache: FileStateCache | None = None,
+        path_sandbox: PathSandbox | None = None,
+    ) -> None:
         self._cache = file_cache
         self.file_history = file_history
         self._state_cache = file_state_cache
+        self._path_sandbox = path_sandbox or PathSandbox(str(Path.cwd()))
+
+    def for_project_root(
+        self,
+        project_root: Path,
+        path_sandbox: PathSandbox,
+    ) -> WriteFile:
+        configured = copy.copy(self)
+        configured._path_sandbox = path_sandbox
+        return configured
 
 
     async def execute(self, params: Params) -> ToolResult:
-        if self.file_history is not None:
-            self.file_history.track_edit(params.file_path)
+        path, path_error = resolve_tool_path(params.file_path, self._path_sandbox)
+        if path is None:
+            return ToolResult(output=path_error, is_error=True)
 
-        path = Path(params.file_path)
+        if self.file_history is not None:
+            self.file_history.track_edit(str(path))
 
         if self._state_cache and path.exists():
             resolved = str(path.resolve())
@@ -52,6 +76,12 @@ class WriteFile(Tool):
                 self._cache.invalidate(str(path.resolve()))
             if self._state_cache:
                 self._state_cache.update(str(path.resolve()))
-        except Exception as e:
-            return ToolResult(output=f"Error writing file: {e}", is_error=True)
+        except OSError as exc:
+            log.error(
+                "WriteFile failed: path=%s reason=%s",
+                path,
+                exc,
+                exc_info=True,
+            )
+            return ToolResult(output=f"Error writing file: {exc}", is_error=True)
         return ToolResult(output=f"Successfully wrote to {params.file_path}")

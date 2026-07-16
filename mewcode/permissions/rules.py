@@ -21,6 +21,14 @@ _CONTENT_FIELDS: dict[str, str] = {
     "Grep": "pattern",
 }
 
+_PATH_FIELDS: dict[str, str] = {
+    "ReadFile": "file_path",
+    "WriteFile": "file_path",
+    "EditFile": "file_path",
+    "Glob": "path",
+    "Grep": "path",
+}
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -44,6 +52,13 @@ def parse_rule(raw: str, effect: Effect) -> Rule:
 
 def extract_content(tool_name: str, arguments: dict[str, Any]) -> str:
     field = _CONTENT_FIELDS.get(tool_name)
+    if field is None:
+        return ""
+    return str(arguments.get(field, ""))
+
+
+def extract_path(tool_name: str, arguments: dict[str, Any]) -> str:
+    field = _PATH_FIELDS.get(tool_name)
     if field is None:
         return ""
     return str(arguments.get(field, ""))

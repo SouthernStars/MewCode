@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack
@@ -13,6 +14,8 @@ from mcp.client.streamable_http import streamable_http_client
 from mewcode.config import MCPServerConfig, build_child_env, resolve_env_vars
 
 logger = logging.getLogger(__name__)
+
+MCP_STACK_CLOSE_TIMEOUT_SECONDS = 10
 
 
 class MCPClient:
@@ -49,7 +52,7 @@ class MCPClient:
             self._session = session
             self._alive = True
             logger.info("MCP server '%s' connected", self.name)
-        except Exception:
+        except BaseException:
             await self._cleanup_stack()
             raise
 
@@ -110,12 +113,19 @@ class MCPClient:
     async def _cleanup_stack(self) -> None:
         if self._stack is not None:
             try:
-                await self._stack.__aexit__(None, None, None)
+                await asyncio.wait_for(
+                    self._stack.__aexit__(None, None, None),
+                    timeout=MCP_STACK_CLOSE_TIMEOUT_SECONDS,
+                )
             except RuntimeError as e:
                 if "cancel scope" in str(e):
                     logger.debug("Cancel scope cleanup (expected during shutdown): %s", e)
                 else:
                     raise
             except Exception:
-                logger.debug("Error closing stack for '%s'", self.name, exc_info=True)
+                logger.error(
+                    "Error closing MCP stack: server=%s",
+                    self.name,
+                    exc_info=True,
+                )
             self._stack = None
