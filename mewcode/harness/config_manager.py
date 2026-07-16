@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +37,15 @@ class ConfigChange:
 class ConfigManager:
     """运行时配置读写。"""
 
-    def __init__(self, app_config: Any = None) -> None:
+    def __init__(
+        self,
+        app_config: Any = None,
+        *,
+        on_change: dict[str, Callable[[Any], None]] | None = None,
+    ) -> None:
         self._config = app_config
         self._changes: list[ConfigChange] = []
+        self._on_change = on_change or {}
 
     def bind_config(self, app_config: Any) -> None:
         """注入配置引用。"""
@@ -101,6 +107,14 @@ class ConfigManager:
                 setattr(target, last, value)
             else:
                 return False, f"Config has no attribute '{last}'"
+
+            callback = self._on_change.get(key)
+            if callback is not None:
+                try:
+                    callback(value)
+                except Exception:
+                    setattr(target, last, old_value)
+                    raise
 
         except Exception as e:
             return False, f"Failed to set config: {e}"

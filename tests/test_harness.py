@@ -119,9 +119,9 @@ def test_app_keeps_runtime_config_for_harness() -> None:
     from mewcode.app import MewCodeApp
 
     config = make_app_config()
-    app = MewCodeApp(providers=config.providers, app_config=config)
+    app = MewCodeApp(config=config)
 
-    assert app._app_config is config
+    assert app.config is config
 
 
 @pytest.mark.asyncio
