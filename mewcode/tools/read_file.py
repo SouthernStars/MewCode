@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from mewcode.permissions.sandbox import PathSandbox
 from mewcode.tools.base import Tool, ToolResult
+from mewcode.tools.path_utils import resolve_tool_path
 
 if TYPE_CHECKING:
     from mewcode.cache import FileCache
@@ -29,13 +32,30 @@ class ReadFile(Tool):
     is_concurrency_safe = True
 
 
-    def __init__(self, file_cache: FileCache | None = None, file_state_cache: FileStateCache | None = None) -> None:
+    def __init__(
+        self,
+        file_cache: FileCache | None = None,
+        file_state_cache: FileStateCache | None = None,
+        path_sandbox: PathSandbox | None = None,
+    ) -> None:
         self._cache = file_cache
         self._state_cache = file_state_cache
+        self._path_sandbox = path_sandbox or PathSandbox(str(Path.cwd()))
+
+    def for_project_root(
+        self,
+        project_root: Path,
+        path_sandbox: PathSandbox,
+    ) -> ReadFile:
+        configured = copy.copy(self)
+        configured._path_sandbox = path_sandbox
+        return configured
 
 
     async def execute(self, params: Params) -> ToolResult:
-        path = Path(params.file_path)
+        path, path_error = resolve_tool_path(params.file_path, self._path_sandbox)
+        if path is None:
+            return ToolResult(output=path_error, is_error=True)
         if not path.exists():
             return ToolResult(output=f"Error: file not found: {params.file_path}", is_error=True)
         if not path.is_file():
@@ -43,21 +63,21 @@ class ReadFile(Tool):
 
         resolved = str(path.resolve())
 
-        try:
-            text = self._cache.get(resolved) if self._cache else None
-            if text is None:
+        text = self._cache.get(resolved) if self._cache else None
+        if text is None:
+            try:
                 text = path.read_text(encoding="utf-8")
-                if self._cache:
-                    self._cache.put(resolved, text)
-        except Exception as exc:
-            log.error(
-                "ReadFile failed: path=%s resolved_path=%s reason=%s",
-                params.file_path,
-                resolved,
-                exc,
-                exc_info=True,
-            )
-            return ToolResult(output=f"Error reading file: {exc}", is_error=True)
+            except (OSError, UnicodeError) as exc:
+                log.error(
+                    "ReadFile failed: path=%s resolved_path=%s reason=%s",
+                    params.file_path,
+                    resolved,
+                    exc,
+                    exc_info=True,
+                )
+                return ToolResult(output=f"Error reading file: {exc}", is_error=True)
+            if self._cache:
+                self._cache.put(resolved, text)
 
         if self._state_cache:
             try:

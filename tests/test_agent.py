@@ -561,6 +561,55 @@ async def test_tool_pipeline_records_audit_and_metrics_in_order():
         "metrics",
     ]
 
+
+@pytest.mark.asyncio
+async def test_tool_execution_timeout_cancels_tool() -> None:
+    cancelled = asyncio.Event()
+
+    class TimeoutParams(BaseModel):
+        pass
+
+    class SlowTool(Tool):
+        name = "SlowMCPTool"
+        description = "slow external tool"
+        params_model = TimeoutParams
+        category = "command"
+        execution_timeout = 0.01
+
+        async def execute(self, params: TimeoutParams) -> ToolResult:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return ToolResult(output="unexpected")
+
+    registry = create_default_registry()
+    registry.register(SlowTool())
+    client = MockLLMClient([
+        [
+            ToolCallComplete("slow-1", "SlowMCPTool", {}),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+        [TextDelta("done"), StreamEnd("end_turn", input_tokens=1, output_tokens=1)],
+    ])
+    agent = Agent(client, registry, "anthropic")
+    conversation = ConversationManager()
+    conversation.add_user_message("run slow external tool")
+
+    events = [event async for event in agent.run(conversation)]
+    results = [
+        event
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    ]
+
+    assert cancelled.is_set()
+    assert len(results) == 1
+    assert results[0].is_error
+    assert "timed out" in results[0].output.lower()
+
+
 @pytest.mark.asyncio
 async def test_token_usage_accumulates():
     """Usage 事件展示的是累计的 token 数量。"""

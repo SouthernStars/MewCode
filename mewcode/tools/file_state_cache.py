@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 class FileStateCache:
@@ -48,6 +51,12 @@ class FileStateCache:
             content = p.read_text(encoding="utf-8")
             mtime_ns = p.stat().st_mtime_ns
             self._cache[path] = (content, mtime_ns)
-        except OSError:
+        except OSError as exc:
             # If we can't read it back, just remove the stale entry.
+            log.error(
+                "File state cache refresh failed: path=%s reason=%s",
+                path,
+                exc,
+                exc_info=True,
+            )
             self._cache.pop(path, None)

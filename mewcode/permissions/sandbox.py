@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
+
+
+class PathSandboxViolation(ValueError):
+    """Raised when a user-provided path resolves outside allowed roots."""
 
 
 class PathSandbox:
@@ -13,7 +16,7 @@ class PathSandbox:
         extra_allowed: list[str] | None = None,
     ) -> None:
         root = Path(project_root).resolve()
-        self._allowed_roots: list[Path] = [root, Path(tempfile.gettempdir()).resolve()]
+        self._allowed_roots: list[Path] = [root]
         if extra_allowed:
             for p in extra_allowed:
                 self._allowed_roots.append(Path(p).resolve())
@@ -24,38 +27,30 @@ class PathSandbox:
         return self._allowed_roots[0]
 
 
-    def check(self, path: str) -> tuple[bool, str]:
+    def resolve(self, path: str) -> Path:
         p = Path(path).expanduser()
         if not p.is_absolute():
             p = self.project_root / p
-        abs_path = p.absolute()
-
         try:
-            real_path = abs_path.resolve(strict=True)
-        except OSError:
-            ancestor = abs_path
-            while True:
-                try:
-                    exists = ancestor.exists()
-                except OSError:
-                    exists = False
-                if exists:
-                    break
-                parent = ancestor.parent
-                if parent == ancestor:
-                    return False, f"无法解析路径: {path}"
-                ancestor = parent
-            try:
-                resolved_ancestor = ancestor.resolve(strict=True)
-            except OSError:
-                return False, f"无法解析路径: {path}"
-            real_path = resolved_ancestor / abs_path.relative_to(ancestor)
+            real_path = p.resolve(strict=False)
+        except OSError as exc:
+            raise PathSandboxViolation(
+                f"无法解析路径 {path}: {exc}"
+            ) from exc
 
         for root in self._allowed_roots:
             try:
                 real_path.relative_to(root)
-                return True, ""
+                return real_path
             except ValueError:
                 continue
 
-        return False, f"路径 {path} 超出沙箱范围"
+        raise PathSandboxViolation(f"路径 {path} 超出沙箱范围")
+
+
+    def check(self, path: str) -> tuple[bool, str]:
+        try:
+            self.resolve(path)
+        except PathSandboxViolation as exc:
+            return False, str(exc)
+        return True, ""

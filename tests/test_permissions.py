@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -142,9 +143,17 @@ class TestPathSandbox:
         ok, _ = self.sandbox.check(str(new_file))
         assert ok
 
-    def test_temp_dir_allowed(self) -> None:
+    def test_temp_dir_denied_by_default(self) -> None:
         tmp = Path(tempfile.gettempdir()) / "mewcode_test.txt"
-        ok, _ = self.sandbox.check(str(tmp))
+        ok, reason = self.sandbox.check(str(tmp))
+        assert not ok
+        assert "沙箱" in reason
+
+    def test_explicit_extra_root_allowed(self) -> None:
+        extra = self.tmpdir.parent / "explicit-extra"
+        extra.mkdir(exist_ok=True)
+        sandbox = PathSandbox(str(self.tmpdir), extra_allowed=[str(extra)])
+        ok, _ = sandbox.check(str(extra / "allowed.txt"))
         assert ok
 
     def test_relative_path_resolution(self) -> None:
@@ -193,6 +202,26 @@ class TestRuleEngine:
         assert extract_content("Glob", {"pattern": "**/*.py"}) == "**/*.py"
         assert extract_content("Grep", {"pattern": "TODO"}) == "TODO"
         assert extract_content("UnknownTool", {"x": 1}) == ""
+
+    def test_glob_path_escape_is_denied(self, tmp_path: Path) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        tool = create_default_registry().get("Glob")
+        assert tool is not None
+        checker = PermissionChecker(
+            detector=DangerousCommandDetector(),
+            sandbox=PathSandbox(str(project)),
+            rule_engine=RuleEngine(),
+            mode=PermissionMode.DEFAULT,
+        )
+
+        decision = checker.check(
+            tool,
+            {"path": str(tmp_path), "pattern": "**/*.py"},
+        )
+
+        assert decision.effect == "deny"
+        assert "沙箱" in decision.reason
 
     def test_evaluate_single_tier(self) -> None:
         tmpdir = Path(tempfile.mkdtemp())
@@ -249,6 +278,39 @@ class TestRuleEngine:
 # ===========================================================================
 
 class TestPermissionMode:
+    @pytest.mark.parametrize(
+        ("mode", "category", "expected"),
+        [
+            (PermissionMode.DEFAULT, "read", "allow"),
+            (PermissionMode.DEFAULT, "write", "ask"),
+            (PermissionMode.DEFAULT, "command", "ask"),
+            (PermissionMode.DEFAULT, "harness", "ask"),
+            (PermissionMode.ACCEPT_EDITS, "read", "allow"),
+            (PermissionMode.ACCEPT_EDITS, "write", "allow"),
+            (PermissionMode.ACCEPT_EDITS, "command", "ask"),
+            (PermissionMode.ACCEPT_EDITS, "harness", "ask"),
+            (PermissionMode.PLAN, "read", "allow"),
+            (PermissionMode.PLAN, "write", "deny"),
+            (PermissionMode.PLAN, "command", "deny"),
+            (PermissionMode.PLAN, "harness", "deny"),
+            (PermissionMode.BYPASS, "read", "allow"),
+            (PermissionMode.BYPASS, "write", "allow"),
+            (PermissionMode.BYPASS, "command", "allow"),
+            (PermissionMode.BYPASS, "harness", "allow"),
+            (PermissionMode.DONT_ASK, "read", "allow"),
+            (PermissionMode.DONT_ASK, "write", "allow"),
+            (PermissionMode.DONT_ASK, "command", "allow"),
+            (PermissionMode.DONT_ASK, "harness", "allow"),
+        ],
+    )
+    def test_decision_table(
+        self,
+        mode: PermissionMode,
+        category: str,
+        expected: str,
+    ) -> None:
+        assert mode_decide(mode, category) == expected
+
     def test_default_mode(self) -> None:
         assert mode_decide(PermissionMode.DEFAULT, "read") == "allow"
         assert mode_decide(PermissionMode.DEFAULT, "write") == "ask"
@@ -328,6 +390,43 @@ class TestPermissionChecker:
         tool = WriteFile()
         d = self.checker.check(tool, {"file_path": str(self.tmpdir / "x.txt"), "content": "hi"})
         assert d.effect == "deny"
+
+    def test_plan_mode_allows_safe_read_only_command(self) -> None:
+        from mewcode.tools.bash import Bash
+
+        self.checker.mode = PermissionMode.PLAN
+        decision = self.checker.check(Bash(), {"command": "git status"})
+        assert decision.effect == "allow"
+
+    def test_plan_file_exception_cannot_escape_sandbox(self) -> None:
+        from mewcode.tools.write_file import WriteFile
+
+        plan_path = self.tmpdir / ".mewcode" / "plans" / "plan.md"
+        self.checker.mode = PermissionMode.PLAN
+        self.checker.plan_file_path = str(plan_path)
+        outside = self.tmpdir.parent / "outside" / plan_path.name
+
+        decision = self.checker.check(
+            WriteFile(),
+            {"file_path": str(outside), "content": "unsafe"},
+        )
+
+        assert decision.effect == "deny"
+        assert "沙箱" in decision.reason
+
+    def test_exact_plan_file_is_allowed_inside_sandbox(self) -> None:
+        from mewcode.tools.write_file import WriteFile
+
+        plan_path = self.tmpdir / ".mewcode" / "plans" / "plan.md"
+        self.checker.mode = PermissionMode.PLAN
+        self.checker.plan_file_path = str(plan_path)
+
+        decision = self.checker.check(
+            WriteFile(),
+            {"file_path": str(plan_path), "content": "safe"},
+        )
+
+        assert decision.effect == "allow"
 
     def test_bypass_mode_allows_all(self) -> None:
         from mewcode.tools.bash import Bash
@@ -489,6 +588,12 @@ async def test_e2e_rule_allows_git():
     rules_file = tmpdir / ".mewcode" / "permissions.yaml"
     rules_file.parent.mkdir(parents=True)
     rules_file.write_text(yaml.dump([{"rule": "Bash(git *)", "effect": "allow"}]))
+    subprocess.run(
+        ["git", "init"],
+        cwd=tmpdir,
+        capture_output=True,
+        check=True,
+    )
 
     client = MockLLMClient([
         [

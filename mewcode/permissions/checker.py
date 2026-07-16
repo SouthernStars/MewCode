@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from mewcode.permissions.dangerous import DangerousCommandDetector, is_safe_command
 from mewcode.permissions.modes import DecisionEffect, PermissionMode, mode_decide
-from mewcode.permissions.rules import RuleEngine, extract_content
+from mewcode.permissions.rules import RuleEngine, extract_content, extract_path
 from mewcode.permissions.sandbox import PathSandbox
 from mewcode.tools.base import Tool
 
@@ -38,6 +37,13 @@ class PermissionChecker:
 
     def check(self, tool: Tool, arguments: dict[str, Any]) -> Decision:
         content = extract_content(tool.name, arguments)
+        path = extract_path(tool.name, arguments)
+
+        # 路径边界是所有权限模式都不能绕过的安全不变量。
+        if tool.category in ("read", "write") and path:
+            ok, reason = self.sandbox.check(path)
+            if not ok:
+                return Decision(effect="deny", reason=f"路径沙箱拦截: {reason}")
 
         # Layer 0: Plan 模式例外放行
         if self.mode == PermissionMode.PLAN:
@@ -56,12 +62,6 @@ class PermissionChecker:
             hit, reason = self.detector.detect(content)
             if hit:
                 return Decision(effect="deny", reason=f"危险命令拦截: {reason}")
-
-        # Layer 2: 路径沙箱（仅文件类工具）
-        if tool.category in ("read", "write") and content:
-            ok, reason = self.sandbox.check(content)
-            if not ok:
-                return Decision(effect="deny", reason=f"路径沙箱拦截: {reason}")
 
         # Layer 3: 规则引擎匹配
         rule_result = self.rule_engine.evaluate(tool.name, content)
@@ -84,10 +84,8 @@ class PermissionChecker:
     def _is_plan_file(self, target_path: str) -> bool:
         if not self.plan_file_path or not target_path:
             return ".mewcode/plans/" in target_path
-        abs_target = os.path.abspath(target_path)
-        abs_plan = os.path.abspath(self.plan_file_path)
-        if abs_target == abs_plan:
-            return True
-        if os.path.basename(target_path) == os.path.basename(self.plan_file_path):
+        target = self.sandbox.resolve(target_path)
+        plan = self.sandbox.resolve(self.plan_file_path)
+        if target == plan:
             return True
         return ".mewcode/plans/" in target_path

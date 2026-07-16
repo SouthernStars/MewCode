@@ -211,6 +211,7 @@ class TestMCPToolWrapper:
         assert wrapper.name == "mcp_github_search_issues"
         assert wrapper.category == "command"
         assert wrapper.description == "Search GitHub issues"
+        assert wrapper.execution_timeout == 60
 
     def test_get_schema_uses_original_input_schema(self) -> None:
         from mcp import types as mcp_types
@@ -232,6 +233,64 @@ class TestMCPToolWrapper:
         schema = wrapper.get_schema()
         assert schema["name"] == "mcp_srv_search"
         assert schema["input_schema"] == input_schema
+
+    @pytest.mark.asyncio
+    async def test_cancellation_marks_client_unhealthy(self) -> None:
+        from mcp import types as mcp_types
+        from mewcode.mcp.tool_wrapper import MCPToolWrapper
+
+        class SlowClient:
+            is_alive = True
+            _alive = True
+
+            async def call_tool(self, name: str, arguments: dict[str, Any]):
+                await asyncio.sleep(60)
+
+        client = SlowClient()
+        tool_def = mcp_types.Tool(
+            name="slow",
+            description="Slow external call",
+            inputSchema={"type": "object", "properties": {}},
+        )
+        wrapper = MCPToolWrapper("srv", tool_def, client)  # type: ignore[arg-type]
+        task = asyncio.create_task(wrapper.execute(wrapper.params_model()))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not client._alive
+
+
+@pytest.mark.asyncio
+async def test_manager_reports_connection_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mewcode.mcp import manager as manager_module
+    from mewcode.tools import ToolRegistry
+
+    client = MagicMock()
+    client.close = AsyncMock()
+
+    async def slow_connect() -> None:
+        await asyncio.sleep(60)
+
+    client.connect = slow_connect
+    monkeypatch.setattr(manager_module, "MCP_CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(manager_module, "MCPClient", lambda config: client)
+    manager = MCPManager()
+    manager.load_configs([
+        MCPServerConfig(name="slow-server", command="fake-command"),
+    ])
+
+    errors = await manager.register_all_tools(ToolRegistry())
+
+    assert len(errors) == 1
+    assert "slow-server" in errors[0]
+    assert "timed out after 0.01s" in errors[0]
+    client.close.assert_awaited_once()
+    assert manager._clients == {}
 
 # ===========================================================================
 # _extract_text

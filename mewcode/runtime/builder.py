@@ -259,15 +259,18 @@ class RuntimeBuilder:
         session = session_manager.create()
         file_history = FileHistory(self.work_dir, session.session_id)
         conversation = ConversationManager()
+        path_sandbox = PathSandbox(self.work_dir)
         registry = create_default_registry(
             file_cache=file_cache,
             file_history=file_history,
+            project_root=self.work_dir,
+            path_sandbox=path_sandbox,
         )
         provider = self.settings.provider.to_config()
         client = create_client(provider)
         checker = PermissionChecker(
             detector=DangerousCommandDetector(),
-            sandbox=PathSandbox(self.work_dir),
+            sandbox=path_sandbox,
             rule_engine=RuleEngine(
                 user_rules_path=home / ".mewcode" / "permissions.yaml",
                 project_rules_path=work_path / ".mewcode" / "permissions.yaml",

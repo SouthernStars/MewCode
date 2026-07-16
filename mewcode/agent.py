@@ -294,11 +294,19 @@ class Agent:
         task_supervisor: TaskSupervisor | None = None,
     ) -> None:
         self.client = client
-        self.registry = registry
         self.protocol = protocol
-        self.work_dir = work_dir
+        self.work_dir = str(Path(work_dir).resolve())
         self.max_iterations = max_iterations
         self.permission_checker = permission_checker
+        path_sandbox = (
+            getattr(permission_checker, "sandbox", None)
+            if permission_checker is not None
+            else None
+        )
+        self.registry = registry.for_project_root(
+            self.work_dir,
+            path_sandbox=path_sandbox,
+        )
         self.permission_mode: PermissionMode = (
             permission_checker.mode if permission_checker else PermissionMode.DEFAULT
         )
@@ -939,12 +947,50 @@ class Agent:
         tc = prepared.call
         try:
             params = prepared.tool.params_model.model_validate(tc.arguments)
-            result = await prepared.tool.execute(params)
+            execution = prepared.tool.execute(params)
+            timeout = prepared.tool.execution_timeout
+            if timeout is None:
+                result = await execution
+            else:
+                result = await asyncio.wait_for(execution, timeout=timeout)
         except ValidationError as exc:
             result = ToolResult(
                 output=f"Parameter validation error: {exc}",
                 is_error=True,
             )
+        except asyncio.TimeoutError:
+            timeout = prepared.tool.execution_timeout
+            if timeout is None:
+                log.error(
+                    "Tool raised TimeoutError without a configured execution "
+                    "timeout: agent_id=%s session_id=%s tool=%s tool_call_id=%s",
+                    self.agent_id,
+                    self.session_id,
+                    tc.tool_name,
+                    tc.tool_id,
+                    exc_info=True,
+                )
+                result = ToolResult(
+                    output=f"Tool execution raised TimeoutError: {tc.tool_name}",
+                    is_error=True,
+                )
+            else:
+                log.error(
+                    "Tool execution timed out: agent_id=%s session_id=%s tool=%s "
+                    "tool_call_id=%s timeout=%ss",
+                    self.agent_id,
+                    self.session_id,
+                    tc.tool_name,
+                    tc.tool_id,
+                    timeout,
+                )
+                result = ToolResult(
+                    output=(
+                        f"Tool execution timed out after {timeout}s: "
+                        f"{tc.tool_name}"
+                    ),
+                    is_error=True,
+                )
         except Exception as exc:
             log.error(
                 "Tool execution failed: agent_id=%s session_id=%s tool=%s "

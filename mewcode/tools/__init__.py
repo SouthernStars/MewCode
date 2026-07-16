@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mewcode.tools.base import Tool
@@ -13,6 +14,8 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
         self._disabled: set[str] = set()
         self._discovered: set[str] = set()
+        self._project_root: Path | None = None
+        self._path_sandbox: Any = None
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
@@ -116,6 +119,32 @@ class ToolRegistry:
     def list_tools(self) -> list[Tool]:
         return list(self._tools.values())
 
+    def for_project_root(
+        self,
+        project_root: str | Path,
+        path_sandbox: Any = None,
+    ) -> ToolRegistry:
+        from mewcode.permissions.sandbox import PathSandbox
+
+        root = Path(project_root).resolve()
+        sandbox = path_sandbox or PathSandbox(str(root))
+        if (
+            root == self._project_root
+            and (
+                path_sandbox is None
+                or path_sandbox is self._path_sandbox
+            )
+        ):
+            return self
+        configured = ToolRegistry()
+        for tool in self._tools.values():
+            configured.register(tool.for_project_root(root, sandbox))
+        configured._disabled = set(self._disabled)
+        configured._discovered = set(self._discovered)
+        configured._project_root = root
+        configured._path_sandbox = sandbox
+        return configured
+
 
     def get_all_schemas(self, protocol: str = "anthropic") -> list[dict[str, Any]]:
         schemas: list[dict[str, Any]] = []
@@ -137,7 +166,13 @@ class ToolRegistry:
         return schemas
 
 
-def create_default_registry(file_cache: FileCache | None = None, file_history: Any = None) -> ToolRegistry:
+def create_default_registry(
+    file_cache: FileCache | None = None,
+    file_history: Any = None,
+    project_root: str | Path | None = None,
+    path_sandbox: Any = None,
+) -> ToolRegistry:
+    from mewcode.permissions.sandbox import PathSandbox
     from mewcode.tools.bash import Bash
     from mewcode.tools.edit_file import EditFile
     from mewcode.tools.file_state_cache import FileStateCache
@@ -147,12 +182,29 @@ def create_default_registry(file_cache: FileCache | None = None, file_history: A
     from mewcode.tools.write_file import WriteFile
 
     file_state_cache = FileStateCache()
+    sandbox = path_sandbox or PathSandbox(str(project_root or Path.cwd()))
 
     registry = ToolRegistry()
-    registry.register(ReadFile(file_cache=file_cache, file_state_cache=file_state_cache))
-    registry.register(WriteFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
-    registry.register(EditFile(file_cache=file_cache, file_history=file_history, file_state_cache=file_state_cache))
-    registry.register(Bash())
-    registry.register(Glob())
-    registry.register(Grep())
+    registry._project_root = sandbox.project_root
+    registry._path_sandbox = sandbox
+    registry.register(ReadFile(
+        file_cache=file_cache,
+        file_state_cache=file_state_cache,
+        path_sandbox=sandbox,
+    ))
+    registry.register(WriteFile(
+        file_cache=file_cache,
+        file_history=file_history,
+        file_state_cache=file_state_cache,
+        path_sandbox=sandbox,
+    ))
+    registry.register(EditFile(
+        file_cache=file_cache,
+        file_history=file_history,
+        file_state_cache=file_state_cache,
+        path_sandbox=sandbox,
+    ))
+    registry.register(Bash(work_dir=sandbox.project_root))
+    registry.register(Glob(path_sandbox=sandbox))
+    registry.register(Grep(path_sandbox=sandbox))
     return registry
