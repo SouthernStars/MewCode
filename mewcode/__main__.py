@@ -62,117 +62,40 @@ def main() -> None:
     from mewcode.driver import NoAltScreenDriver
 
     app = MewCodeApp(
-        providers=config.providers,
+        config=config,
         permission_mode=permission_mode,
-        mcp_servers=config.mcp_servers,
         hook_engine=hook_engine,
-        enable_fork=config.enable_fork,
-        enable_verification_agent=config.enable_verification_agent,
-        worktree_config=config.worktree,
-        teammate_mode=config.teammate_mode,
-        enable_coordinator_mode=config.enable_coordinator_mode,
-        app_config=config,
         driver_class=NoAltScreenDriver,
     )
-    # 注入 Harness 配置到 app 实例（app 在 _init_harness 中读取）
-    app._compact_config = config.compact
-    app._critic_config = config.critic
-    app._rate_limit_config = config.rate_limit
-    app._allow_self_modification = config.allow_self_modification
-    # 注入 Evolution 配置
-    app._allow_self_evolution = config.allow_self_evolution
-    app._evolution_config = config.evolution
     app.run()
 
 
 async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None:
-    from mewcode.agent import Agent
-    from mewcode.client import create_client, resolve_context_window
-    from mewcode.conversation import ConversationManager
-    from mewcode.memory.instructions import load_instructions
-    from mewcode.permissions import (
-        DangerousCommandDetector,
-        PathSandbox,
-        PermissionChecker,
-        RuleEngine,
+    from mewcode.runtime import (
+        RuntimeBuilder,
+        RuntimeCapabilities,
+        RuntimeSettings,
     )
-    from mewcode.tools import create_default_registry
-    from mewcode.agents.loader import AgentLoader
-    from mewcode.agents.task_manager import TaskManager
-    from mewcode.agents.trace import TraceManager
-    from mewcode.tools.agent_tool import AgentTool
-    from mewcode.tools.impl.tool_search import ToolSearchTool
-    from mewcode.teams.manager import TeamManager
-    from mewcode.teams.models import BackendType
-    from mewcode.tools.team_create import TeamCreateTool
-    from mewcode.tools.team_delete import TeamDeleteTool
-    from mewcode.worktree import WorktreeManager
-    from mewcode.config import WorktreeConfig
 
     provider = config.providers[0]
-    client = create_client(provider)
-    # 第 2 层：尽力从 provider 自动拉取模型的 context window（缓存在 provider 上）。
-    # 不会抛异常或阻塞启动；失败则退化到映射表。
-    await resolve_context_window(provider)
-    work_dir = os.getcwd()
-    home = Path.home()
-
-    checker = PermissionChecker(
-        detector=DangerousCommandDetector(),
-        sandbox=PathSandbox(work_dir),
-        rule_engine=RuleEngine(
-            user_rules_path=home / ".mewcode" / "permissions.yaml",
-            project_rules_path=Path(work_dir) / ".mewcode" / "permissions.yaml",
-            local_rules_path=Path(work_dir) / ".mewcode" / "permissions.local.yaml",
-        ),
-        mode=permission_mode,
+    settings = RuntimeSettings.from_app_config(
+        config,
+        provider=provider,
+        permission_mode=permission_mode,
     )
-
-    instructions = load_instructions(work_dir)
-    registry = create_default_registry()
-    registry.register(ToolSearchTool(registry, protocol=provider.protocol))
-
-    agent = Agent(
-        client=client,
-        registry=registry,
-        protocol=provider.protocol,
-        work_dir=work_dir,
-        permission_checker=checker,
-        context_window=provider.get_context_window(),
-        instructions_content=instructions,
+    runtime = RuntimeBuilder(
+        settings,
+        work_dir=os.getcwd(),
+        capabilities=RuntimeCapabilities.noninteractive(),
         hook_engine=hook_engine,
-    )
+    ).build()
+    await runtime.refresh_context_window()
+    await runtime.start()
 
-    wt_cfg = config.worktree or WorktreeConfig()
-    wt_manager = WorktreeManager(
-        repo_root=work_dir,
-        symlink_directories=wt_cfg.symlink_directories,
-    )
-    trace_manager = TraceManager()
-    task_manager = TaskManager()
-    agent_loader = AgentLoader(work_dir, enable_verification=config.enable_verification_agent)
-    agent_loader.load_all()
-    team_manager = TeamManager(worktree_manager=wt_manager, trace_manager=trace_manager)
-
-    agent_tool = AgentTool(
-        agent_loader=agent_loader,
-        task_manager=task_manager,
-        trace_manager=trace_manager,
-        parent_agent=agent,
-        enable_fork=config.enable_fork,
-        provider_config=provider,
-        worktree_manager=wt_manager,
-        team_manager=team_manager,
-    )
-    registry.register(agent_tool)
-    registry.register(TeamCreateTool(
-        team_manager=team_manager,
-        parent_agent=agent,
-        teammate_mode="in-process",
-        is_interactive=False,
-        enable_coordinator_mode=config.enable_coordinator_mode,
-    ))
-    registry.register(TeamDeleteTool(team_manager=team_manager, parent_agent=agent))
+    agent = runtime.agent
+    task_manager = runtime.task_manager
+    team_manager = runtime.team_manager
+    conv = runtime.conversation
 
     def drain_notifications() -> list[str]:
         notes: list[str] = []
@@ -185,37 +108,31 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None
         notes.extend(team_manager.drain_lead_mailbox())
         return notes
 
-    def drain_mailbox_only() -> list[str]:
-        return team_manager.drain_lead_mailbox()
-
-    agent.notification_fn = drain_mailbox_only
-
-    conv = ConversationManager()
-    last_result = await agent.run_to_completion(prompt, conv)
-    print(last_result, flush=True)
-
-    if not team_manager._teams:
-        return
-
-    import sys
-    for i in range(90):
-        await asyncio.sleep(2)
-        running = {k: not t.done() for k, t in task_manager._async_tasks.items()}
-        completed_ids = [t.id for t in task_manager._tasks.values() if t.status != "running"]
-        print(f"[poll {i}] running={running} completed={completed_ids} teams={list(team_manager._teams.keys())} queue_size={task_manager._notify_queue.qsize()}", file=sys.stderr, flush=True)
-        notes = drain_notifications()
-        if not notes:
-            has_running = any(v for v in running.values())
-            if not has_running:
-                print(f"[poll {i}] no running tasks, breaking", file=sys.stderr, flush=True)
-                break
-            continue
-        for note in notes:
-            conv.add_system_reminder(note)
-        last_result = await agent.run_to_completion(
-            "Teammate notifications received. Process them and continue.", conv
-        )
+    try:
+        last_result = await agent.run_to_completion(prompt, conv)
         print(last_result, flush=True)
+
+        for _ in range(90):
+            if not team_manager._teams:
+                break
+            await asyncio.sleep(2)
+            running = {
+                task_id: not task.done()
+                for task_id, task in task_manager._async_tasks.items()
+            }
+            notes = drain_notifications()
+            if not notes:
+                if not any(running.values()):
+                    break
+                continue
+            for note in notes:
+                conv.add_system_reminder(note)
+            last_result = await agent.run_to_completion(
+                "Teammate notifications received. Process them and continue.", conv
+            )
+            print(last_result, flush=True)
+    finally:
+        await runtime.shutdown()
 
 
 if __name__ == "__main__":

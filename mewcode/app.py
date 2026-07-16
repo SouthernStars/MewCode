@@ -41,7 +41,6 @@ from mewcode.client import (
     LLMClient,
     LLMError,
     create_client,
-    resolve_context_window,
 )
 from mewcode.commands import (
     CommandContext,
@@ -51,8 +50,8 @@ from mewcode.commands import (
 )
 from mewcode.commands.completion import CompletionPopup
 from mewcode.commands.handlers import register_all_commands
-from mewcode.config import AppConfig, MCPServerConfig, ProviderConfig
-from mewcode.hooks import HookContext, HookEngine, load_hooks
+from mewcode.config import AppConfig, ProviderConfig
+from mewcode.hooks import HookEngine
 from mewcode.conversation import ConversationManager, Message
 from mewcode.mcp import MCPManager
 from mewcode.memory import (
@@ -65,13 +64,7 @@ from mewcode.memory import (
     make_compact_boundary,
     render_reminder,
 )
-from mewcode.permissions import (
-    DangerousCommandDetector,
-    PathSandbox,
-    PermissionChecker,
-    PermissionMode,
-    RuleEngine,
-)
+from mewcode.permissions import PermissionMode
 from mewcode.agents.loader import AgentLoader
 from mewcode.agents.task_manager import TaskManager
 from mewcode.agents.trace import TraceManager
@@ -83,15 +76,19 @@ from mewcode.commands.handlers.skill_register import register_skill_commands
 from rich.text import Text as RichText
 from textual.theme import Theme
 from mewcode.cache import FileCache
-from mewcode.tools import ToolRegistry, create_default_registry
-from mewcode.tools.agent_tool import AgentTool
+from mewcode.tools import ToolRegistry
 from mewcode.tools.ask_user import AskUserEvent, AskUserTool
-from mewcode.tools.impl.tool_search import ToolSearchTool
 from mewcode.tools.load_skill import LoadSkill
-from mewcode.worktree.cleanup import start_stale_cleanup_task
 from mewcode.worktree.manager import WorktreeManager
 from mewcode.commands.handlers.worktree import create_worktree_command
 from mewcode.teammate_tree import TeammateTree
+from mewcode.runtime import (
+    Runtime,
+    RuntimeBuilder,
+    RuntimeCallbacks,
+    RuntimeCapabilities,
+    RuntimeSettings,
+)
 
 import re
 
@@ -572,36 +569,24 @@ class MewCodeApp(App):
 
     def __init__(
         self,
-        providers: list[ProviderConfig],
+        config: AppConfig,
         permission_mode: PermissionMode = PermissionMode.DEFAULT,
-        mcp_servers: list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
-        enable_fork: bool = False,
-        enable_verification_agent: bool = False,
-        worktree_config: Any = None,
-        teammate_mode: str = "",
-        enable_coordinator_mode: bool = False,
-        app_config: AppConfig | None = None,
         driver_class: type | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
-        self.providers = providers
+        self.config = config
+        self.providers = config.providers
         self._initial_permission_mode = permission_mode
-        self._mcp_server_configs = mcp_servers or []
         self.hook_engine = hook_engine
-        self._enable_fork = enable_fork
-        self._enable_verification_agent = enable_verification_agent
-        self._worktree_config = worktree_config
-        self._teammate_mode = teammate_mode
-        self._enable_coordinator_mode = enable_coordinator_mode
-        self._app_config = app_config
-        self.file_cache = FileCache()
+        self.runtime: Runtime | None = None
+        self._runtime_start_task: asyncio.Task[None] | None = None
+        self.file_cache: FileCache | None = None
         self.client: LLMClient | None = None
-        self.conversation = ConversationManager()
-        self.registry: ToolRegistry = create_default_registry(file_cache=self.file_cache)
+        self.conversation: ConversationManager | None = None
+        self.registry: ToolRegistry | None = None
         self.agent: Agent | None = None
         self.mcp_manager: MCPManager | None = None
-        self._mcp_init_task: asyncio.Task[None] | None = None
         self._selected_provider: ProviderConfig | None = None
         self._streaming = False
         self._thinking_start: float = 0.0
@@ -616,18 +601,16 @@ class MewCodeApp(App):
         self.session_manager: SessionManager | None = None
         self.session: Session | None = None
         self.memory_manager: MemoryManager | None = None
-        self._instructions_content: str = ""
         self.command_registry = CommandRegistry()
         register_all_commands(self.command_registry)
         self.skill_loader: SkillLoader | None = None
         self.skill_executor: SkillExecutor | None = None
         self._load_skill_tool: LoadSkill | None = None
         self.agent_loader: AgentLoader | None = None
-        self.task_manager: TaskManager = TaskManager()
-        self.trace_manager: TraceManager = TraceManager()
+        self.task_manager: TaskManager | None = None
+        self.trace_manager: TraceManager | None = None
         self._notification_check_task: asyncio.Task[None] | None = None
         self.worktree_manager: WorktreeManager | None = None
-        self._stale_cleanup_task: asyncio.Task[None] | None = None
         self._current_streaming_label: Static | None = None
         self._current_ai_row: Vertical | None = None
         self._current_accumulated_text: str = ""
@@ -636,14 +619,6 @@ class MewCodeApp(App):
         self._mcp_connecting: bool = False
         self._teammate_tree: TeammateTree | None = None
         self._teammate_timer = None
-        # Harness 配置（由 __main__.py 在构造后设置）
-        self._compact_config: Any = None
-        self._critic_config: Any = None
-        self._rate_limit_config: Any = None
-        self._allow_self_modification: bool = False
-        # Evolution 配置（由 __main__.py 在构造后设置）
-        self._allow_self_evolution: bool = False
-        self._evolution_config: Any = None
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -689,197 +664,45 @@ class MewCodeApp(App):
 
     def _select_provider(self, provider: ProviderConfig) -> None:
         self._selected_provider = provider
+        settings = RuntimeSettings.from_app_config(
+            self.config,
+            provider=provider,
+            permission_mode=self._initial_permission_mode,
+        )
+        callbacks = RuntimeCallbacks(
+            on_workflow_log=lambda message: self._show_system_message(
+                f"[workflow] {message}"
+            ),
+            on_scheduled_fire=self._on_scheduled_fire,
+            on_mcp_ready=self._on_mcp_ready,
+        )
         try:
-            self.client = create_client(provider)
+            runtime = RuntimeBuilder(
+                settings,
+                work_dir=os.getcwd(),
+                capabilities=RuntimeCapabilities.interactive(),
+                hook_engine=self.hook_engine,
+                callbacks=callbacks,
+            ).build()
         except AuthenticationError as e:
             self._show_error(str(e))
             return
-
-        work_dir = os.getcwd()
-        home = Path.home()
-        checker = PermissionChecker(
-            detector=DangerousCommandDetector(),
-            sandbox=PathSandbox(work_dir),
-            rule_engine=RuleEngine(
-                user_rules_path=home / ".mewcode" / "permissions.yaml",
-                project_rules_path=Path(work_dir) / ".mewcode" / "permissions.yaml",
-                local_rules_path=Path(work_dir) / ".mewcode" / "permissions.local.yaml",
-            ),
-            mode=self._initial_permission_mode,
-        )
-
-        self._instructions_content = load_instructions(work_dir)
-        self.memory_manager = MemoryManager(work_dir)
-        self.session_manager = SessionManager(work_dir)
-        self.session_manager.cleanup()
-        self.session = self.session_manager.create()
-
-        from mewcode.filehistory import FileHistory
-        self.file_history = FileHistory(work_dir, self.session.session_id)
-        for tool in self.registry.list_tools():
-            if hasattr(tool, "file_history"):
-                tool.file_history = self.file_history
-
-        load_skill_tool = LoadSkill()
-        self.registry.register(load_skill_tool)
-        self._load_skill_tool = load_skill_tool
-
-        self.registry.register(
-            ToolSearchTool(self.registry, protocol=provider.protocol)
-        )
-        self.registry.register(AskUserTool())
-
-        from mewcode.tools.exit_plan_mode import ExitPlanModeTool
-        self._exit_plan_tool = ExitPlanModeTool()
-        self.registry.register(self._exit_plan_tool)
-
-        self.agent = Agent(
-            client=self.client,
-            registry=self.registry,
-            protocol=provider.protocol,
-            work_dir=work_dir,
-            permission_checker=checker,
-            context_window=provider.get_context_window(),
-            instructions_content=self._instructions_content,
-            memory_manager=self.memory_manager,
-            hook_engine=self.hook_engine,
-        )
-        self.agent.file_history = self.file_history
-        self.agent.session_id = self.session.session_id
-
-        self._exit_plan_tool._is_plan_mode = lambda: self.agent.plan_mode
-        self._exit_plan_tool._plan_exists = lambda: self.agent._get_plan_path().exists()
+        self._adopt_runtime(runtime)
+        work_dir = runtime.work_dir
 
         # Layer 2: 在后台异步拉取模型的 context window，不阻塞启动流程。
         # agent 已经有一个同步解析的窗口值（来自配置 / 映射表 / 默认值）；
         # 如果异步拉取成功，就原地升级为更准确的值。
         self.run_worker(
-            self._resolve_context_window(provider), exclusive=False
+            runtime.refresh_context_window(), exclusive=False
         )
-
-        self.skill_loader = SkillLoader(work_dir)
-        self.skill_loader.load_all()
-
-        load_skill_tool.set_loader(self.skill_loader)
-        load_skill_tool.set_agent(self.agent)
-
-        self.skill_executor = SkillExecutor(
-            agent=self.agent,
-            client=self.client,
-            protocol=provider.protocol,
-        )
-
-        catalog = self.skill_loader.get_catalog()
-        if catalog:
-            lines = [
-                "You can use the following Skills:",
-                "",
-            ]
-            for name, desc in catalog:
-                lines.append(f"- {name}: {desc}")
-            lines.append("")
-            lines.append(
-                "If the user's request matches a Skill, call LoadSkill to activate it."
-            )
-            self.agent.set_skill_catalog("\n".join(lines))
 
         register_skill_commands(
             self.command_registry, self.skill_loader, self.skill_executor
         )
 
-        # --- Worktree 系统初始化 ---
-        from mewcode.config import WorktreeConfig
-        wt_cfg = self._worktree_config or WorktreeConfig()
-        self.worktree_manager = WorktreeManager(
-            repo_root=work_dir,
-            file_cache=self.file_cache,
-            symlink_directories=wt_cfg.symlink_directories,
-        )
-        restored = self.worktree_manager.restore_session()
-        if restored:
-            self.agent.work_dir = restored.worktree_path
-
         wt_command = create_worktree_command(self.worktree_manager)
         self.command_registry.register_sync(wt_command)
-
-        from mewcode.tools.enter_worktree import EnterWorktreeTool
-        from mewcode.tools.exit_worktree import ExitWorktreeTool
-        self.registry.register(EnterWorktreeTool(worktree_manager=self.worktree_manager))
-        self.registry.register(ExitWorktreeTool(worktree_manager=self.worktree_manager))
-
-        self._stale_cleanup_task = asyncio.create_task(
-            start_stale_cleanup_task(
-                self.worktree_manager,
-                wt_cfg.stale_cleanup_interval,
-                wt_cfg.stale_cutoff_hours,
-            )
-        )
-
-        # --- 子 agent 系统初始化 ---
-        self.agent_loader = AgentLoader(
-            work_dir, enable_verification=self._enable_verification_agent
-        )
-        self.agent_loader.load_all()
-
-        # --- Agent 团队系统初始化 ---
-        from mewcode.teams.manager import TeamManager
-        from mewcode.tools.team_create import TeamCreateTool
-        from mewcode.tools.team_delete import TeamDeleteTool
-
-        self.team_manager = TeamManager(worktree_manager=self.worktree_manager, trace_manager=self.trace_manager)
-
-        agent_tool = AgentTool(
-            agent_loader=self.agent_loader,
-            task_manager=self.task_manager,
-            trace_manager=self.trace_manager,
-            parent_agent=self.agent,
-            enable_fork=self._enable_fork,
-            provider_config=provider,
-            worktree_manager=self.worktree_manager,
-            team_manager=self.team_manager,
-        )
-        self.registry.register(agent_tool)
-
-        team_create_tool = TeamCreateTool(
-            team_manager=self.team_manager,
-            parent_agent=self.agent,
-            teammate_mode=self._teammate_mode,
-            is_interactive=True,
-            enable_coordinator_mode=self._enable_coordinator_mode,
-        )
-        self.registry.register(team_create_tool)
-
-        team_delete_tool = TeamDeleteTool(
-            team_manager=self.team_manager,
-            parent_agent=self.agent,
-        )
-        self.registry.register(team_delete_tool)
-
-        agent_catalog = self.agent_loader.list_agents()
-        if agent_catalog:
-            lines = [
-                "## Available Sub-Agent Types",
-                "",
-                "Use the Agent tool with subagent_type parameter to delegate tasks:",
-                "",
-            ]
-            for agent_type, when_to_use in agent_catalog:
-                lines.append(f"- **{agent_type}**: {when_to_use}")
-            if self._enable_fork:
-                lines.append("")
-                lines.append(
-                    "Leave subagent_type empty to fork the current conversation "
-                    "(inherits full dialog history)."
-                )
-            lines.append("")
-            lines.append(
-                "IMPORTANT: Sub-agents run in the background. "
-                "After calling the Agent tool, you will get a task ID immediately. "
-                "Do NOT wait, sleep, or poll for the result. "
-                "Simply report the task ID to the user and end your turn. "
-                "The system will automatically notify when the task completes."
-            )
-            self.agent.set_agent_catalog("\n".join(lines), catalog_list=agent_catalog)
 
         tasks_cmd = create_tasks_command(self.task_manager)
         self.command_registry.register_sync(tasks_cmd)
@@ -888,28 +711,8 @@ class MewCodeApp(App):
         trace_cmd = create_trace_command(self.trace_manager, self.agent.agent_id)
         self.command_registry.register_sync(trace_cmd)
 
-        # --- 协调者模式初始化（工具已注册，激活推迟到 TeamCreate 时） ---
-        from mewcode.tools.synthetic_output import SyntheticOutputTool
-
-        self.registry.register(SyntheticOutputTool())
-        self.agent._team_manager = self.team_manager
-
-        if self.hook_engine:
-            asyncio.ensure_future(
-                self.hook_engine.run_hooks(
-                    "startup", HookContext(event_name="startup")
-                )
-            )
-
-        if self._mcp_server_configs:
-            self._mcp_init_task = asyncio.create_task(self._init_mcp())
-
-        # --- Loop Engineering 初始化 ---
-        self._init_workflow_engine(provider, work_dir)
-        self._init_scheduler(work_dir)
-
-        # --- Harness Engineering 初始化 ---
-        self._init_harness(work_dir, provider)
+        self._mcp_connecting = bool(runtime.settings.mcp_servers)
+        self._runtime_start_task = asyncio.create_task(runtime.start())
 
         self.query_one("#model-label", Static).update(provider.model)
         work_dir = os.getcwd()
@@ -932,293 +735,55 @@ class MewCodeApp(App):
             self._start_notification_polling()
         )
 
-    async def _resolve_context_window(self, provider: ProviderConfig) -> None:
-        """Layer 2 后台 worker：异步拉取模型的 context window，
-        拉到就原地升级 agent 的窗口值。
+    def _adopt_runtime(self, runtime: Runtime) -> None:
+        """Expose runtime services to the existing UI adapters."""
+        self.runtime = runtime
+        self.client = runtime.client
+        self.conversation = runtime.conversation
+        self.registry = runtime.registry
+        self.agent = runtime.agent
+        self.file_cache = runtime.file_cache
+        self.memory_manager = runtime.memory_manager
+        self.session_manager = runtime.session_manager
+        self.session = runtime.session
+        self.file_history = runtime.file_history
+        self.task_manager = runtime.task_manager
+        self.trace_manager = runtime.trace_manager
+        self.skill_loader = runtime.skill_loader
+        self.skill_executor = runtime.skill_executor
+        self._load_skill_tool = runtime.load_skill_tool
+        self.worktree_manager = runtime.worktree_manager
+        self.agent_loader = runtime.agent_loader
+        self.team_manager = runtime.team_manager
+        self.workflow_engine = runtime.workflow_engine
+        self.cron_store = runtime.cron_store
+        self.wakeup_scheduler = runtime.wakeup_scheduler
+        self.scheduler_runtime = runtime.scheduler_runtime
+        self.critic = runtime.critic
+        self.audit_logger = runtime.audit_logger
+        self.rate_limiter = runtime.rate_limiter
+        self.metrics_collector = runtime.metrics_collector
+        self.hook_manager = runtime.hook_manager
+        self.config_manager = runtime.config_manager
+        self.permission_manager_harness = runtime.permission_manager
+        self.mcp_manager = runtime.mcp_manager
+        self.evolution_manager = runtime.evolution_manager
+        self._exit_plan_tool = runtime.exit_plan_tool
 
-        尽力而为 — resolve_context_window 不会抛异常；如果拉不到，
-        agent 继续使用同步解析得到的窗口值。
-        """
-        await resolve_context_window(provider)
-        if self.agent is not None:
-            self.agent.context_window = provider.get_context_window()
-
-    # -----------------------------------------------------------------
-    # Loop Engineering 初始化
-    # -----------------------------------------------------------------
-
-    def _init_workflow_engine(self, provider: ProviderConfig, work_dir: str) -> None:
-        """初始化 Workflow 编排引擎并注册相关工具。"""
-        from mewcode.workflow.engine import WorkflowEngine
-        from mewcode.workflow.tool import ListWorkflowsTool, WorkflowTool
-
-        # 创建 engine（agent_factory 延迟绑定）
-        self.workflow_engine = WorkflowEngine(
-            work_dir=work_dir,
-            on_log=lambda msg: self._show_system_message(f"[workflow] {msg}"),
-        )
-
-        # 注册工具
-        self.registry.register(WorkflowTool(
-            engine=self.workflow_engine,
-            task_manager=self.task_manager,
-        ))
-        self.registry.register(ListWorkflowsTool(engine=self.workflow_engine))
-
-        # 注入到 Agent
-        if self.agent:
-            self.agent.workflow_engine = self.workflow_engine
-
-    def _init_scheduler(self, work_dir: str) -> None:
-        """初始化调度系统。"""
-        from mewcode.scheduler.store import CronStore
-        from mewcode.scheduler.runtime import SchedulerRuntime
-        from mewcode.scheduler.wakeup import WakeupScheduler
-        from mewcode.scheduler.tools import (
-            CronCreateTool, CronDeleteTool, CronListTool, ScheduleWakeupTool,
-        )
-
-        self.cron_store = CronStore(work_dir)
-        self.wakeup_scheduler = WakeupScheduler()
-
-        self.scheduler_runtime = SchedulerRuntime(
-            cron_store=self.cron_store,
-            wakeup_scheduler=self.wakeup_scheduler,
-            on_fire=lambda job: self._on_scheduled_fire(job),
-        )
-
-        # 注册 Cron 工具
-        self.registry.register(CronCreateTool(self.cron_store))
-        self.registry.register(CronDeleteTool(self.cron_store))
-        self.registry.register(CronListTool(self.cron_store))
-        self.registry.register(ScheduleWakeupTool(self.wakeup_scheduler))
-
-        # 启动调度器后台循环
-        asyncio.create_task(self.scheduler_runtime.start())
+    def _on_mcp_ready(self, errors: list[str], instructions: str) -> None:
+        self._mcp_connecting = False
+        self._mcp_instructions = instructions
+        for error in errors:
+            self._show_system_message(f"MCP warning: {error}")
+        if self.runtime and self.runtime.mcp_manager._clients:
+            self._mcp_server_info = (
+                f"Connected to {len(self.runtime.mcp_manager._clients)} MCP server(s)"
+            )
+        self._update_mode_label()
 
     def _on_scheduled_fire(self, job: Any) -> None:
-        """调度任务触发时的回调：注入系统消息到对话。"""
-        if self.agent and self.conversation:
-            reminder = self.scheduler_runtime.inject_job(job)
-            self.conversation.add_system_reminder(reminder)
-            self._show_system_message(f"[scheduler] job fired: {job.prompt[:60]}")
-
-    # -----------------------------------------------------------------
-    # Harness Engineering 初始化
-    # -----------------------------------------------------------------
-
-    def _init_harness(self, work_dir: str, provider: ProviderConfig) -> None:
-        """初始化 Harness 增强组件。"""
-        from mewcode.context.critic import CompletenessCritic
-        from mewcode.permissions.audit import AuditLogger
-        from mewcode.permissions.rate_limit import RateLimiter
-        from mewcode.agents.metrics import MetricsCollector
-        from mewcode.harness.hook_manager import HookManager
-        from mewcode.harness.config_manager import ConfigManager
-        from mewcode.harness.permission_manager import PermissionManager
-        from mewcode.harness.tools import (
-            AddHookTool, RemoveHookTool, ListHooksTool,
-            UpdateConfigTool,
-            AddPermissionRuleTool, RemovePermissionRuleTool,
-            ManageMemoryTool,
-        )
-
-        # 从配置读取
-        compact_cfg = getattr(self, '_compact_config', None)
-        critic_cfg = getattr(self, '_critic_config', None)
-        rate_cfg = getattr(self, '_rate_limit_config', None)
-        allow_self = getattr(self, '_allow_self_modification', False)
-
-        # Completeness Critic
-        critic_enabled = critic_cfg.enabled if critic_cfg else False
-        self.critic = CompletenessCritic(enabled=critic_enabled)
-
-        # Audit Logger
-        session_id = self.session.session_id if self.session else ""
-        self.audit_logger = AuditLogger(work_dir, session_id=session_id)
-
-        # Rate Limiter
-        rate_enabled = rate_cfg.enabled if rate_cfg else True
-        rate_default = rate_cfg.default_max_per_minute if rate_cfg else 30
-        rate_per_tool = rate_cfg.per_tool if rate_cfg else {"Bash": 10, "WriteFile": 20}
-        self.rate_limiter = RateLimiter(
-            enabled=rate_enabled,
-            default_max_per_minute=rate_default,
-            per_tool_limits=rate_per_tool,
-        )
-
-        # Metrics Collector
-        self.metrics_collector = MetricsCollector(work_dir, session_id=session_id)
-
-        # Harness Managers
-        self.hook_manager = HookManager(hook_engine=self.hook_engine)
-        self.config_manager = ConfigManager(self._app_config)
-        self.permission_manager_harness = PermissionManager(
-            work_dir=work_dir,
-            rule_engine=(
-                self.agent.permission_checker.rule_engine
-                if self.agent and self.agent.permission_checker
-                else None
-            ),
-        )
-
-        # -----------------------------------------------------------------
-        # 自进化工具注册（受 allow_self_modification 元权限控制）
-        #
-        # 当 allow_self_modification: true 时，将 Harness 自进化工具
-        # 实例化并注册到 Agent 的 ToolRegistry，使 Agent 能在运行时：
-        #   - 增删生命周期 Hook（AddHook / RemoveHook / ListHooks）
-        #   - 热更新白名单内配置项（UpdateConfig）
-        #   - 管理本地权限规则（AddPermissionRule / RemovePermissionRule）
-        #   - 增删查长期记忆条目（ManageMemory）
-        #
-        # 所有自进化工具 category="harness"，权限检查器据此识别并
-        # 叠加 allow_self_modification 元权限校验。
-        # 单个工具注册失败不影响其余 — 异常被隔离并记录日志。
-        # -----------------------------------------------------------------
-        if allow_self:
-            import logging as _harness_log
-            _log = _harness_log.getLogger(__name__)
-
-            # 构建候选工具列表：(实例, 显示名称)
-            _tool_candidates: list[tuple[Any, str]] = []
-
-            # ---- Hook 管理 (依赖 self.hook_manager) ----
-            _tool_candidates.extend([
-                (AddHookTool(self.hook_manager),    "AddHook"),
-                (RemoveHookTool(self.hook_manager), "RemoveHook"),
-                (ListHooksTool(self.hook_manager),  "ListHooks"),
-            ])
-
-            # ---- 配置管理 (依赖 self.config_manager) ----
-            _tool_candidates.append(
-                (UpdateConfigTool(self.config_manager), "UpdateConfig")
-            )
-
-            # ---- 权限规则管理 (依赖 self.permission_manager_harness) ----
-            _tool_candidates.extend([
-                (AddPermissionRuleTool(self.permission_manager_harness),
-                 "AddPermissionRule"),
-                (RemovePermissionRuleTool(self.permission_manager_harness),
-                 "RemovePermissionRule"),
-            ])
-
-            # ---- Memory 管理 (依赖 self.memory_manager) ----
-            _tool_candidates.append(
-                (ManageMemoryTool(self.memory_manager), "ManageMemory")
-            )
-
-            # 逐个注册，异常隔离
-            _registered = 0
-            _failed = 0
-            for _tool_inst, _tool_name in _tool_candidates:
-                try:
-                    self.registry.register(_tool_inst)
-                    _registered += 1
-                    _log.info(
-                        "[harness] tool registered: %s (category=%s)",
-                        _tool_name,
-                        getattr(_tool_inst, 'category', 'unknown'),
-                    )
-                except Exception as _exc:
-                    _failed += 1
-                    _log.error(
-                        "[harness] tool registration failed: %s — %s",
-                        _tool_name, _exc,
-                    )
-
-            _log.info(
-                "[harness] self-evolution tools: %d registered, %d failed, %d total",
-                _registered, _failed, len(_tool_candidates),
-            )
-
-        # 注入到 Agent
-        if self.agent:
-            self.agent.critic = self.critic
-            self.agent.audit_logger = self.audit_logger
-            self.agent.rate_limiter = self.rate_limiter
-            self.agent.metrics_collector = self.metrics_collector
-
-        # --- Evolution Engineering 初始化 ---
-        self._init_evolution(work_dir)
-
-    def _init_evolution(self, work_dir: str) -> None:
-        """初始化自进化子系统。"""
-        allow_evo = getattr(self, '_allow_self_evolution', False)
-        evo_cfg = getattr(self, '_evolution_config', None)
-
-        if not allow_evo or evo_cfg is None:
-            return
-
-        from mewcode.harness.evolution.manager import EvolutionManager
-        from mewcode.harness.evolution.tools import (
-            TriggerEvolutionTool,
-            ListEvolutionsTool,
-            GetEvolutionDetailTool,
-            ListAutoSkillsTool,
-            DeprecateSkillTool,
-        )
-
-        harness_dir = Path(work_dir) / "mewcode" / "harness"
-
-        # 创建 EvolutionManager
-        self.evolution_manager = EvolutionManager(
-            harness_dir=harness_dir,
-            config=evo_cfg,
-            client_factory=self._make_evolution_client(),
-            session_manager=self.session_manager,
-            memory_manager=self.memory_manager,
-            skill_loader=self.skill_loader,
-        )
-
-        # 注册进化工具（受 allow_self_evolution 控制）
-        _log = logging.getLogger(__name__)
-        _tool_candidates: list[tuple[Any, str]] = [
-            (TriggerEvolutionTool(self.evolution_manager), "TriggerEvolution"),
-            (ListEvolutionsTool(self.evolution_manager), "ListEvolutions"),
-            (GetEvolutionDetailTool(self.evolution_manager), "GetEvolutionDetail"),
-            (ListAutoSkillsTool(self.evolution_manager.skill_meta_manager), "ListAutoSkills"),
-            (DeprecateSkillTool(self.evolution_manager.skill_meta_manager), "DeprecateSkill"),
-        ]
-
-        _registered = 0
-        _failed = 0
-        for _tool_inst, _tool_name in _tool_candidates:
-            try:
-                self.registry.register(_tool_inst)
-                _registered += 1
-            except Exception as _exc:
-                _failed += 1
-                _log.error("[evolution] tool registration failed: %s — %s", _tool_name, _exc)
-
-        _log.info("[evolution] tools: %d registered, %d failed", _registered, _failed)
-
-    def _make_evolution_client(self):
-        """创建一个轻量级 LLM 客户端工厂，供进化子系统使用。"""
-        from mewcode.tools.base import TextDelta, StreamEnd
-
-        async def _client(prompt: str, system: str = "", model_hint: str = "haiku") -> str:
-            # 使用已有的 client 进行非流式调用
-            if not hasattr(self, 'client') or self.client is None:
-                raise RuntimeError("LLM client not available")
-
-            from mewcode.conversation import ConversationManager, Message
-            conv = ConversationManager()
-            conv.history = [Message(role="user", content=prompt)]
-
-            collected = ""
-            try:
-                async for event in self.client.stream(conv, system=system):
-                    if isinstance(event, TextDelta):
-                        collected += event.text
-                    elif isinstance(event, StreamEnd):
-                        pass
-            except Exception:
-                pass
-
-            return collected
-
-        return _client
+        """Render a scheduled event already injected by Runtime."""
+        self._show_system_message(f"[scheduler] job fired: {job.prompt[:60]}")
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "provider-list":
@@ -1507,9 +1072,9 @@ class MewCodeApp(App):
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
         assert self.agent is not None
 
-        if self._mcp_init_task and not self._mcp_init_task.done():
-            self._show_system_message("Waiting for MCP servers to connect...")
-            await self._mcp_init_task
+        if self._runtime_start_task and not self._runtime_start_task.done():
+            self._show_system_message("Waiting for runtime services to start...")
+            await self._runtime_start_task
 
         self._streaming = True
         chat = self.query_one("#chat-area", VerticalScroll)
@@ -2054,60 +1619,6 @@ class MewCodeApp(App):
             pass
 
     # -----------------------------------------------------------------
-    # MCP
-    # -----------------------------------------------------------------
-
-    async def _init_mcp(self) -> None:
-        self._mcp_connecting = True
-        self._update_mode_label()
-        manager = MCPManager()
-        manager.load_configs(self._mcp_server_configs)
-        tools_before = len(self.registry.list_tools())
-        errors = await manager.register_all_tools(self.registry)
-        self.mcp_manager = manager
-        self._mcp_connecting = False
-        self._update_mode_label()
-        for err in errors:
-            self._show_system_message(f"MCP warning: {err}")
-        tools_after = len(self.registry.list_tools())
-        mcp_tools = tools_after - tools_before
-        server_count = len(manager._clients)
-        if server_count > 0:
-            self._mcp_server_info = (
-                f"Connected to {server_count} MCP server(s), {mcp_tools} tools registered"
-            )
-        if server_count > 0 and mcp_tools > 0:
-            parts = []
-            for cfg in self._mcp_server_configs:
-                srv_name = cfg.name if hasattr(cfg, 'name') else str(cfg)
-                tool_names = [
-                    t.name for t in self.registry.list_tools()
-                    if t.name.startswith(f"mcp__{srv_name}__")
-                ]
-                section = f"## {srv_name}\n"
-                if tool_names:
-                    section += "Available tools: " + ", ".join(tool_names)
-                parts.append(section)
-            self._mcp_instructions = (
-                "# MCP Server Instructions\n\n"
-                "The following MCP servers are connected. "
-                "Use their tools when the user asks.\n\n"
-                + "\n\n".join(parts)
-            )
-
-    async def _shutdown_mcp(self) -> None:
-        if self._mcp_init_task is not None:
-            self._mcp_init_task.cancel()
-            try:
-                await self._mcp_init_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._mcp_init_task = None
-        if self.mcp_manager is not None:
-            await self.mcp_manager.shutdown()
-            self.mcp_manager = None
-
-    # -----------------------------------------------------------------
     # 退出
     # -----------------------------------------------------------------
 
@@ -2131,50 +1642,14 @@ class MewCodeApp(App):
         self._exit_requested = True
 
         async def _cleanup() -> None:
-            tasks: list[asyncio.Task] = []
-
-            if self.agent and self.agent.memory_manager:
-                tasks.append(asyncio.create_task(
-                    self.agent._extract_memories(self.conversation)
-                ))
-            if self.hook_engine:
-                tasks.append(asyncio.create_task(
-                    self.hook_engine.run_hooks(
-                        "shutdown", HookContext(event_name="shutdown")
-                    )
-                ))
-            tasks.append(asyncio.create_task(self._shutdown_mcp()))
-
-            if tasks:
-                await asyncio.wait(tasks, timeout=3.0)
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-
-            if self._stale_cleanup_task and not self._stale_cleanup_task.done():
-                self._stale_cleanup_task.cancel()
-
-            if hasattr(self, 'team_manager'):
-                for name in list(self.team_manager._teams):
-                    try:
-                        team = self.team_manager._teams[name]
-                        for m in team.members:
-                            team.set_member_active(m.name, False)
-                        self.team_manager.delete_team(name)
-                    except Exception:
-                        pass
-
-            if self.session:
-                self.session.close()
-
-            # Evolution cleanup: flush traces + check evolution trigger
-            if hasattr(self, 'evolution_manager') and self.evolution_manager is not None:
+            if self._runtime_start_task and not self._runtime_start_task.done():
+                self._runtime_start_task.cancel()
                 try:
-                    self.evolution_manager.trace_collector.flush()
-                    await self.evolution_manager.check_and_evolve()
-                    self.evolution_manager.cleanup()
-                except Exception:
+                    await self._runtime_start_task
+                except asyncio.CancelledError:
                     pass
+            if self.runtime is not None:
+                await self.runtime.shutdown()
 
         try:
             await _cleanup()
