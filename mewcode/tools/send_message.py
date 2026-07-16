@@ -122,8 +122,14 @@ class SendMessageTool(Tool):
         try:
             from mewcode.teams.spawn_tmux import send_keys_to_pane
             send_keys_to_pane(pane_id, "")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error(
+                "Failed to wake teammate pane: agent_id=%s pane_id=%s reason=%s",
+                agent_id,
+                pane_id,
+                exc,
+                exc_info=True,
+            )
 
     def _wake_pane_members(self, team: Any, agent_ids: list[str]) -> None:
         for aid in agent_ids:

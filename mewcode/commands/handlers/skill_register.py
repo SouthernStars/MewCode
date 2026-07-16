@@ -67,6 +67,13 @@ def register_skill_commands(
                                 f"[{name} skill result]\n{result}"
                             )
                         except Exception as e:
+                            log.error(
+                                "Fork skill failed: skill=%s args=%r reason=%s",
+                                name,
+                                ctx.args,
+                                e,
+                                exc_info=True,
+                            )
                             ctx.ui.add_system_message(
                                 f"Skill {name} failed: {e}"
                             )

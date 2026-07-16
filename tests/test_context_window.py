@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -125,17 +126,22 @@ class TestAutoFetch:
             mk.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_fetch_raises_degrades_to_mapping_table(self):
+    async def test_fetch_raises_degrades_to_mapping_table(self, caplog):
         p = _provider(model="claude-sonnet-4-6")
         fake = AsyncMock()
         fake.fetch_model_context_window = AsyncMock(
             side_effect=RuntimeError("boom")
         )
-        with patch("mewcode.client.create_client", return_value=fake):
+        with caplog.at_level(logging.ERROR), patch(
+            "mewcode.client.create_client",
+            return_value=fake,
+        ):
             # 不应抛出异常。
             await resolve_context_window(p)
         # 对 claude 回退到映射表。
         assert p.get_context_window() == 200_000
+        assert "claude-sonnet-4-6" in caplog.text
+        assert "boom" in caplog.text
 
     @pytest.mark.asyncio
     async def test_fetch_returns_none_degrades_to_default(self):
@@ -148,15 +154,17 @@ class TestAutoFetch:
         assert p.get_context_window() == 128_000
 
     @pytest.mark.asyncio
-    async def test_client_construction_failure_degrades(self):
+    async def test_client_construction_failure_degrades(self, caplog):
         # 例如缺少 API key 会在 create_client 内部抛错 —— 必须被吞掉。
         p = _provider(model="claude-sonnet-4-6")
-        with patch(
+        with caplog.at_level(logging.ERROR), patch(
             "mewcode.client.create_client",
             side_effect=Exception("no api key"),
         ):
             await resolve_context_window(p)
         assert p.get_context_window() == 200_000
+        assert "claude-sonnet-4-6" in caplog.text
+        assert "no api key" in caplog.text
 
     @pytest.mark.asyncio
     async def test_non_anthropic_provider_is_not_fetched(self):

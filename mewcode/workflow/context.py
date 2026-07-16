@@ -155,16 +155,30 @@ class WorkflowContext:
             if schema and cached.result_json:
                 try:
                     return schema.model_validate_json(cached.result_json)
-                except Exception:
-                    pass  # 降级到实际执行
+                except (ValueError, TypeError) as exc:
+                    log.error(
+                        "Workflow structured cache validation failed: call_id=%s "
+                        "label=%s reason=%s",
+                        cached.call_id,
+                        label or "(none)",
+                        exc,
+                        exc_info=True,
+                    )
             if not schema and cached.result_json:
                 try:
                     data = json.loads(cached.result_json)
                     if isinstance(data, dict) and "text" in data:
                         return data["text"]
                     return cached.result_json
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, TypeError) as exc:
+                    log.error(
+                        "Workflow cache decode failed: call_id=%s label=%s "
+                        "reason=%s",
+                        cached.call_id,
+                        label or "(none)",
+                        exc,
+                        exc_info=True,
+                    )
 
         log.info(
             "[workflow] cache miss: agent call (label=%s), executing",
@@ -281,10 +295,14 @@ class WorkflowContext:
                         current = await stage_fn(current)
                     else:
                         current = await stage_fn(current, item, idx)
-                except Exception as e:
-                    log.warning(
-                        "[workflow] pipeline item %d failed at stage %d: %s",
-                        idx, stage_idx, e,
+                except Exception as exc:
+                    log.error(
+                        "Workflow pipeline stage failed: item_index=%d "
+                        "stage_index=%d reason=%s",
+                        idx,
+                        stage_idx,
+                        exc,
+                        exc_info=True,
                     )
                     current = None
                     break
@@ -316,8 +334,12 @@ class WorkflowContext:
         async def _safe(thunk: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
             try:
                 return await thunk()
-            except Exception as e:
-                log.warning("[workflow] parallel task failed: %s", e)
+            except Exception as exc:
+                log.error(
+                    "Workflow parallel task failed: reason=%s",
+                    exc,
+                    exc_info=True,
+                )
                 return None
 
         tasks = [_safe(t) for t in thunks]

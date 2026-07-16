@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message as TMessage
 from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -92,6 +93,8 @@ from mewcode.runtime import (
 
 import re
 
+log = logging.getLogger(__name__)
+
 MAX_TRUNCATED_LINES = 20
 MAX_AT_REF_BYTES = 10240
 
@@ -117,8 +120,14 @@ def scan_files_for_at(prefix: str, work_dir: str, limit: int = 10) -> list[str]:
                 matches.append(rel)
                 if len(matches) >= limit:
                     break
-    except OSError:
-        pass
+    except OSError as exc:
+        log.error(
+            "File completion scan failed: base=%s prefix=%s reason=%s",
+            base,
+            prefix,
+            exc,
+            exc_info=True,
+        )
     return matches
 
 
@@ -129,9 +138,16 @@ def expand_at_refs(text: str, work_dir: str) -> str:
         if not os.path.isfile(full_path):
             return m.group(0)
         try:
-            content = open(full_path, encoding="utf-8", errors="replace").read(MAX_AT_REF_BYTES)
+            with open(full_path, encoding="utf-8", errors="replace") as file:
+                content = file.read(MAX_AT_REF_BYTES)
             return f"[File: {rel_path}]\n```\n{content}\n```"
-        except Exception:
+        except OSError as exc:
+            log.error(
+                "Failed to expand @ reference: path=%s reason=%s",
+                full_path,
+                exc,
+                exc_info=True,
+            )
             return m.group(0)
     return _AT_REF_RE.sub(_replace, text)
 
@@ -171,8 +187,13 @@ class ChatInput(TextArea):
             try:
                 lines = self._history_file.read_text(encoding="utf-8").splitlines()
                 self._history = [l for l in lines if l.strip()]
-            except Exception:
-                pass
+            except OSError as exc:
+                log.error(
+                    "Failed to load chat history: path=%s reason=%s",
+                    self._history_file,
+                    exc,
+                    exc_info=True,
+                )
 
     def _persist_entry(self, text: str) -> None:
         if self._history_file is None:
@@ -181,13 +202,18 @@ class ChatInput(TextArea):
             self._history_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self._history_file, "a", encoding="utf-8") as f:
                 f.write(text + "\n")
-        except Exception:
-            pass
+        except OSError as exc:
+            log.error(
+                "Failed to persist chat history: path=%s reason=%s",
+                self._history_file,
+                exc,
+                exc_info=True,
+            )
 
     def _popup(self) -> CompletionPopup | None:
         try:
             return self.app.query_one(CompletionPopup)
-        except Exception:
+        except NoMatches:
             return None
 
     def action_submit(self) -> None:
@@ -916,8 +942,15 @@ class MewCodeApp(App):
         ctx = self._build_command_context(args)
         try:
             await cmd.handler(ctx)
-        except Exception as e:
-            self._show_error(f"命令执行失败: {e}")
+        except Exception as exc:
+            log.error(
+                "Command execution failed: command=%s args=%r reason=%s",
+                cmd.name,
+                args,
+                exc,
+                exc_info=True,
+            )
+            self._show_error(f"命令执行失败: {exc}")
 
     # -----------------------------------------------------------------
     # 输入处理
@@ -930,8 +963,14 @@ class MewCodeApp(App):
                 self._agent_task.cancel()
                 try:
                     await self._agent_task
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception as exc:
+                    log.error(
+                        "Agent task failed while interrupting response: reason=%s",
+                        exc,
+                        exc_info=True,
+                    )
             self._finish_streaming()
             self._show_system_message("(response interrupted)")
         await self._dispatch_command(text)
@@ -1076,7 +1115,21 @@ class MewCodeApp(App):
                 timeout=8.0,
             )
             return render_reminder(results)
-        except (asyncio.TimeoutError, Exception):
+        except asyncio.TimeoutError:
+            log.error(
+                "Memory prefetch timed out: query=%r model=%s timeout=8s",
+                query,
+                provider.model,
+            )
+            return ""
+        except Exception as exc:
+            log.error(
+                "Memory prefetch failed: query=%r model=%s reason=%s",
+                query,
+                provider.model,
+                exc,
+                exc_info=True,
+            )
             return ""
 
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
@@ -1123,8 +1176,18 @@ class MewCodeApp(App):
                 reminder = await asyncio.wait_for(prefetch_task, timeout=3.0)
                 if reminder:
                     self.conversation.add_system_reminder(reminder)
-            except (asyncio.TimeoutError, Exception):
-                pass
+            except asyncio.TimeoutError:
+                log.error(
+                    "Memory prefetch collection timed out: query=%r timeout=3s",
+                    text,
+                )
+            except Exception as exc:
+                log.error(
+                    "Memory prefetch collection failed: query=%r reason=%s",
+                    text,
+                    exc,
+                    exc_info=True,
+                )
 
         history_cursor = len(self.conversation.history)
 
@@ -1378,8 +1441,12 @@ class MewCodeApp(App):
         self.call_after_refresh(chat.scroll_end, animate=False)
         try:
             self.query_one("#chat-input").disabled = True
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to disable chat input for plan approval: reason=%s",
+                exc,
+                exc_info=True,
+            )
 
     def on_inline_plan_widget_responded(
         self, event: "InlinePlanWidget.Responded"
@@ -1388,13 +1455,21 @@ class MewCodeApp(App):
 
         try:
             self.query_one("#plan-inline", InlinePlanWidget).remove()
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to remove plan approval widget: reason=%s",
+                exc,
+                exc_info=True,
+            )
         try:
             self.query_one("#chat-input").disabled = False
             self.query_one("#chat-input").focus()
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to restore chat input after plan approval: reason=%s",
+                exc,
+                exc_info=True,
+            )
 
         if self.agent is None:
             return
@@ -1406,8 +1481,13 @@ class MewCodeApp(App):
         if plan_path.exists():
             try:
                 plan_content = plan_path.read_text(encoding="utf-8")
-            except Exception:
-                pass
+            except OSError as exc:
+                log.error(
+                    "Failed to read approved plan: path=%s reason=%s",
+                    plan_path,
+                    exc,
+                    exc_info=True,
+                )
 
         pre = getattr(self, "_pre_plan_mode", PermissionMode.DEFAULT)
         if choice == PlanChoice.YOLO:
@@ -1436,8 +1516,12 @@ class MewCodeApp(App):
         self.call_after_refresh(chat.scroll_end, animate=False)
         try:
             self.query_one("#chat-input").disabled = True
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to disable chat input for user question: reason=%s",
+                exc,
+                exc_info=True,
+            )
 
     def on_inline_ask_user_widget_responded(
         self, event: "InlineAskUserWidget.Responded"
@@ -1450,13 +1534,21 @@ class MewCodeApp(App):
             self._pending_askuser_event = None
         try:
             self.query_one("#askuser-inline", InlineAskUserWidget).remove()
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to remove user question widget: reason=%s",
+                exc,
+                exc_info=True,
+            )
         try:
             self.query_one("#chat-input").disabled = False
             self.query_one("#chat-input").focus()
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to restore chat input after user question: reason=%s",
+                exc,
+                exc_info=True,
+            )
 
     def _start_spinner(self) -> None:
         """启动 braille spinner 动画（每帧 80ms）。"""
@@ -1495,8 +1587,12 @@ class MewCodeApp(App):
             if self._spinner_idx % 5 == 0:
                 try:
                     self.query_one("#chat-area", VerticalScroll).scroll_end(animate=False)
-                except Exception:
-                    pass
+                except NoMatches as exc:
+                    log.error(
+                        "Failed to scroll chat during spinner update: reason=%s",
+                        exc,
+                        exc_info=True,
+                    )
 
     def _start_teammate_polling(self) -> None:
         """Start polling teammate progress every 0.5s."""
@@ -1545,8 +1641,13 @@ class MewCodeApp(App):
                 label.update(f"[cyan]● {count} teammate{'s' if count != 1 else ''}[/cyan]  ")
             else:
                 label.update("")
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to update teammates label: count=%d reason=%s",
+                count,
+                exc,
+                exc_info=True,
+            )
 
     async def _handle_permission_request(self, request: PermissionRequest) -> None:
         from mewcode.permission_dialog import InlinePermissionWidget
@@ -1559,8 +1660,14 @@ class MewCodeApp(App):
         # 权限提示弹窗期间禁用输入框
         try:
             self.query_one("#chat-input").disabled = True
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to disable chat input for permission request: tool=%s "
+                "reason=%s",
+                request.tool_name,
+                exc,
+                exc_info=True,
+            )
 
     def on_inline_permission_widget_responded(
         self, event: "InlinePermissionWidget.Responded"
@@ -1575,14 +1682,22 @@ class MewCodeApp(App):
         try:
             widget = self.query_one("#perm-inline", InlinePermissionWidget)
             widget.remove()
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to remove permission widget: reason=%s",
+                exc,
+                exc_info=True,
+            )
         # 重新启用输入框
         try:
             self.query_one("#chat-input").disabled = False
             self.query_one("#chat-input").focus()
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to restore chat input after permission response: reason=%s",
+                exc,
+                exc_info=True,
+            )
 
     # -----------------------------------------------------------------
     # 恢复 session 的消息渲染
@@ -1627,8 +1742,13 @@ class MewCodeApp(App):
                 self.session.meta.save(
                     self.session._sessions_dir / f"{self.session.session_id}.meta"
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error(
+                "Session summary update failed: session_id=%s reason=%s",
+                self.session.session_id,
+                exc,
+                exc_info=True,
+            )
 
     # -----------------------------------------------------------------
     # 退出
@@ -1644,8 +1764,12 @@ class MewCodeApp(App):
                 inp = self.query_one("#chat-input", ChatInput)
                 inp.disabled = False
                 inp.focus()
-            except Exception:
-                pass
+            except NoMatches as exc:
+                log.error(
+                    "Failed to restore chat input after interruption: reason=%s",
+                    exc,
+                    exc_info=True,
+                )
             return
 
         if getattr(self, "_exit_requested", False):
@@ -1665,8 +1789,12 @@ class MewCodeApp(App):
 
         try:
             await _cleanup()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error(
+                "Application shutdown cleanup failed: reason=%s",
+                exc,
+                exc_info=True,
+            )
         self.exit()
 
     def _show_error(self, text: str) -> None:
@@ -1705,8 +1833,13 @@ class MewCodeApp(App):
                 model_label.update(f"[yellow]MCP connecting…[/yellow]  {model_text}")
             else:
                 model_label.update(model_text)
-        except Exception:
-            pass
+        except NoMatches as exc:
+            log.error(
+                "Failed to update model label: model=%s reason=%s",
+                self._selected_provider.model if self._selected_provider else "",
+                exc,
+                exc_info=True,
+            )
 
     def _update_token_label(self, input_tokens: int, output_tokens: int) -> None:
         pass  # token 标签已从 UI 中移除

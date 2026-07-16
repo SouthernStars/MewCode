@@ -86,8 +86,12 @@ class SchedulerRuntime:
                 await self._check_and_fire()
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                log.error("[scheduler] error in check cycle: %s", e)
+            except Exception as exc:
+                log.error(
+                    "Scheduler check cycle failed: reason=%s",
+                    exc,
+                    exc_info=True,
+                )
 
             # 等待下一个检查周期
             try:
@@ -120,8 +124,13 @@ class SchedulerRuntime:
             if self._on_fire:
                 try:
                     self._on_fire(job)
-                except Exception as e:
-                    log.error("[scheduler] on_fire callback error: %s", e)
+                except Exception as exc:
+                    log.error(
+                        "Scheduler callback failed: job_id=%s reason=%s",
+                        job.id,
+                        exc,
+                        exc_info=True,
+                    )
 
         # 2. Wakeup 任务
         if self._wakeup:
@@ -140,8 +149,14 @@ class SchedulerRuntime:
                             created_at=wk.scheduled_at,
                         )
                         self._on_fire(wakeup_job)
-                    except Exception as e:
-                        log.error("[scheduler] wakeup callback error: %s", e)
+                    except Exception as exc:
+                        log.error(
+                            "Scheduler wakeup callback failed: wakeup_id=%s "
+                            "reason=%s",
+                            wk.id,
+                            exc,
+                            exc_info=True,
+                        )
 
     # ------------------------------------------------------------------
     # 注入给 Agent

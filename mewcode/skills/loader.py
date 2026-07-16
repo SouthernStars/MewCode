@@ -77,11 +77,7 @@ class SkillLoader:
                 meta, body = parse_frontmatter(raw)
                 from mewcode.skills.parser import _validate_meta
                 _validate_meta(meta, f"builtin:{resource.name}")
-                source = None
-                try:
-                    source = Path(str(skill_md))
-                except Exception:
-                    pass
+                source = Path(str(skill_md))
                 skill = SkillDef(
                     name=meta["name"],
                     description=meta["description"],
@@ -94,8 +90,13 @@ class SkillLoader:
                     is_directory=True,
                 )
                 results.append(skill)
-            except (SkillParseError, Exception) as e:
-                log.warning("Skipping builtin skill '%s': %s", resource.name, e)
+            except Exception as exc:
+                log.error(
+                    "Skipping invalid builtin skill: skill=%s reason=%s",
+                    resource.name,
+                    exc,
+                    exc_info=True,
+                )
 
         return results
 

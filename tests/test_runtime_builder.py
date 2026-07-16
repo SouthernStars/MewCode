@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -314,3 +316,48 @@ async def test_runtime_shutdown_waits_for_async_shutdown_hooks(
 
     assert completed.is_set()
     assert runtime.task_supervisor.active_names == ()
+
+
+@pytest.mark.asyncio
+async def test_memory_prefetch_failure_is_logged(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    from mewcode.app import MewCodeApp
+    from mewcode.memory import MemoryManager
+
+    config = make_config()
+    app = MewCodeApp(config=config)
+    app.memory_manager = MemoryManager(str(tmp_path))
+    app._selected_provider = config.providers[0]
+
+    with caplog.at_level(logging.ERROR), patch(
+        "mewcode.app.find_relevant_memories",
+        side_effect=RuntimeError("recall failed"),
+    ):
+        result = await app._prefetch_relevant_memories("where is auth")
+
+    assert result == ""
+    assert "where is auth" in caplog.text
+    assert "test-model" in caplog.text
+    assert "recall failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_session_summary_failure_is_logged(caplog) -> None:
+    from mewcode.app import MewCodeApp
+
+    config = make_config()
+    app = MewCodeApp(config=config)
+    app.session = SimpleNamespace(session_id="session-failed")
+    app.client = FakeClient()
+    app.agent = SimpleNamespace(protocol="openai")
+
+    with caplog.at_level(logging.ERROR), patch(
+        "mewcode.app.generate_session_summary",
+        side_effect=RuntimeError("summary failed"),
+    ):
+        await app._update_session_summary()
+
+    assert "session-failed" in caplog.text
+    assert "summary failed" in caplog.text
