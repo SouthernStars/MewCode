@@ -200,6 +200,7 @@ class AgentTool(Tool):
             context_window=self._parent_agent.context_window,
             instructions_content=definition.system_prompt,
             hook_engine=self._parent_agent.hook_engine,
+            task_supervisor=self._parent_agent.task_supervisor,
         )
         sub_agent.parent_id = self._parent_agent.agent_id
         sub_agent.trace_id = self._parent_agent.trace_id or self._parent_agent.agent_id
@@ -395,6 +396,7 @@ class AgentTool(Tool):
             context_window=self._parent_agent.context_window,
             instructions_content=instructions,
             hook_engine=self._parent_agent.hook_engine,
+            task_supervisor=self._parent_agent.task_supervisor,
         )
         sub_agent.parent_id = self._parent_agent.agent_id
         sub_agent.trace_id = self._parent_agent.trace_id or self._parent_agent.agent_id
@@ -596,6 +598,7 @@ class AgentTool(Tool):
             context_window=self._parent_agent.context_window,
             instructions_content=definition.system_prompt,
             hook_engine=self._parent_agent.hook_engine,
+            task_supervisor=self._parent_agent.task_supervisor,
         )
         sub_agent.parent_id = self._parent_agent.agent_id
         sub_agent.trace_id = self._parent_agent.trace_id or self._parent_agent.agent_id

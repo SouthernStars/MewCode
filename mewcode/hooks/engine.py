@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -8,6 +7,7 @@ from mewcode.hooks.executors import execute_action
 from mewcode.hooks.conditions import parse_condition
 from mewcode.hooks.models import Hook, HookContext, ToolRejectedError
 from mewcode.hooks.models import Action
+from mewcode.task_supervisor import TaskSupervisor
 
 log = logging.getLogger(__name__)
 
@@ -21,11 +21,26 @@ class HookNotification:
 
 
 class HookEngine:
-    def __init__(self, hooks: list[Hook] | None = None) -> None:
+    def __init__(
+        self,
+        hooks: list[Hook] | None = None,
+        *,
+        task_supervisor: TaskSupervisor | None = None,
+    ) -> None:
         self.hooks: list[Hook] = hooks or []
+        self.task_supervisor = task_supervisor or TaskSupervisor()
         self._prompt_messages: list[str] = []
         self._notifications: list[HookNotification] = []
 
+    def bind_task_supervisor(
+        self,
+        task_supervisor: TaskSupervisor,
+    ) -> None:
+        if self.task_supervisor.active_names:
+            raise RuntimeError(
+                "Cannot bind HookEngine with active background tasks"
+            )
+        self.task_supervisor = task_supervisor
 
     def find_matching_hooks(self, event: str, ctx: HookContext) -> list[Hook]:
         matched: list[Hook] = []
@@ -40,12 +55,21 @@ class HookEngine:
         return matched
 
 
-    async def run_hooks(self, event: str, ctx: HookContext) -> None:
+    async def run_hooks(
+        self,
+        event: str,
+        ctx: HookContext,
+        *,
+        wait_for_async: bool = False,
+    ) -> None:
         matched = self.find_matching_hooks(event, ctx)
         for hook in matched:
             hook.mark_executed()
-            if hook.async_exec:
-                asyncio.ensure_future(self._run_single(hook, ctx))
+            if hook.async_exec and not wait_for_async:
+                self.task_supervisor.create(
+                    self._run_single(hook, ctx),
+                    name=f"hook.{event}.{hook.id}",
+                )
             else:
                 await self._run_single(hook, ctx)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from mewcode.config import (
     RateLimitConfig,
 )
 from mewcode.permissions import PermissionMode
+from mewcode.hooks import Action, ActionResult, Hook, HookEngine
 from mewcode.scheduler.store import CronJob
 from mewcode.runtime import (
     RuntimeBuilder,
@@ -127,6 +129,8 @@ def test_builder_equips_interactive_and_noninteractive_consistently(
     assert "ExitPlanMode" not in noninteractive_tools
     assert interactive.agent.registry is interactive.registry
     assert noninteractive.agent.registry is noninteractive.registry
+    assert interactive.agent.task_supervisor is interactive.task_supervisor
+    assert interactive.task_manager.task_supervisor is interactive.task_supervisor
     assert interactive.workflow_engine is not None
     assert noninteractive.workflow_engine is not None
     assert interactive.scheduler_runtime is not None
@@ -226,3 +230,87 @@ async def test_runtime_lifecycle_and_scheduler_injection(tmp_path: Path) -> None
     assert runtime._stale_cleanup_task is None
     assert runtime.task_supervisor.active_names == ()
     assert runtime.session._file.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_cancels_background_agents(tmp_path: Path) -> None:
+    config = make_config()
+    config.mcp_servers = []
+    settings = RuntimeSettings.from_app_config(
+        config,
+        provider=config.providers[0],
+        permission_mode=PermissionMode.DONT_ASK,
+    )
+    started = asyncio.Event()
+
+    class SlowAgent:
+        team_name = ""
+        _team_manager = None
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        async def run_to_completion(self, task, conversation=None):
+            started.set()
+            await asyncio.Event().wait()
+
+    with patch("mewcode.runtime.builder.create_client", return_value=FakeClient()):
+        runtime = RuntimeBuilder(
+            settings,
+            work_dir=str(tmp_path),
+            capabilities=RuntimeCapabilities.noninteractive(),
+        ).build()
+
+    task_id = runtime.task_manager.launch(SlowAgent(), "background work")
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await runtime.shutdown()
+
+    assert runtime.task_manager.get(task_id).status == "cancelled"
+    assert runtime.task_supervisor.active_names == ()
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_waits_for_async_shutdown_hooks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = make_config()
+    config.mcp_servers = []
+    settings = RuntimeSettings.from_app_config(
+        config,
+        provider=config.providers[0],
+        permission_mode=PermissionMode.DONT_ASK,
+    )
+    completed = asyncio.Event()
+
+    async def shutdown_action(action, context):
+        completed.set()
+        return ActionResult(output="done", success=True)
+
+    monkeypatch.setattr(
+        "mewcode.hooks.engine.execute_action",
+        shutdown_action,
+    )
+    hook_engine = HookEngine(
+        [
+            Hook(
+                id="flush",
+                event="shutdown",
+                action=Action(type="command", command="ignored"),
+                async_exec=True,
+            )
+        ]
+    )
+
+    with patch("mewcode.runtime.builder.create_client", return_value=FakeClient()):
+        runtime = RuntimeBuilder(
+            settings,
+            work_dir=str(tmp_path),
+            capabilities=RuntimeCapabilities.noninteractive(),
+            hook_engine=hook_engine,
+        ).build()
+
+    await runtime.shutdown()
+
+    assert completed.is_set()
+    assert runtime.task_supervisor.active_names == ()

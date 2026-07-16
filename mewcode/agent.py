@@ -37,6 +37,7 @@ from mewcode.permissions import (
 from mewcode.hooks import HookContext, HookEngine
 from mewcode.prompts import build_environment_context, build_plan_mode_reminder, build_system_prompt
 from mewcode.tools import ToolRegistry
+from mewcode.task_supervisor import TaskSupervisor
 from mewcode.tools.base import (
     MAX_OUTPUT_CHARS,
     StreamEnd,
@@ -290,6 +291,7 @@ class Agent:
         audit_logger: Any = None,
         rate_limiter: Any = None,
         metrics_collector: Any = None,
+        task_supervisor: TaskSupervisor | None = None,
     ) -> None:
         self.client = client
         self.registry = registry
@@ -321,6 +323,9 @@ class Agent:
         self._agent_catalog: str = ""
         self._agent_catalog_list: list[tuple[str, str]] = []
         self.agent_id: str = uuid.uuid4().hex[:12]
+        self.task_supervisor = task_supervisor or TaskSupervisor(
+            agent_id=self.agent_id
+        )
         self.parent_id: str | None = None
         self.trace_id: str | None = None
         self.coordinator_mode: bool = False
@@ -618,7 +623,10 @@ class Agent:
                     self._loop_count % MEMORY_EXTRACTION_INTERVAL == 0
                     and self.memory_manager
                 ):
-                    asyncio.ensure_future(self._extract_memories(conversation))
+                    self.task_supervisor.create(
+                        self._extract_memories(conversation),
+                        name=f"agent.memory_extract.{self.agent_id}",
+                    )
                 if self.hook_engine:
                     ctx = self._build_hook_context("turn_end")
                     await self.hook_engine.run_hooks("turn_end", ctx)

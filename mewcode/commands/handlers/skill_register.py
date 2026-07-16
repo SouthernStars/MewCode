@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from mewcode.commands.registry import Command, CommandContext, CommandRegistry, CommandType
+from mewcode.task_supervisor import TaskSupervisor
 
 if TYPE_CHECKING:
     from mewcode.skills.executor import SkillExecutor
@@ -19,6 +19,7 @@ def register_skill_commands(
     registry: CommandRegistry,
     loader: SkillLoader,
     executor: SkillExecutor | None = None,
+    task_supervisor: TaskSupervisor | None = None,
 ) -> None:
     for name in list(_REGISTERED_SKILL_NAMES):
         if registry.find(name) is not None:
@@ -70,7 +71,18 @@ def register_skill_commands(
                                 f"Skill {name} failed: {e}"
                             )
 
-                    asyncio.create_task(_run_fork())
+                    supervisor = (
+                        task_supervisor
+                        or getattr(exe.agent, "task_supervisor", None)
+                    )
+                    if supervisor is None:
+                        raise RuntimeError(
+                            f"Skill '{name}' has no TaskSupervisor"
+                        )
+                    supervisor.create(
+                        _run_fork(),
+                        name=f"skill.fork.{name}",
+                    )
                 else:
                     exe.execute_inline(skill, ctx.args)
                     tools_info = ""

@@ -51,8 +51,10 @@ class TaskSupervisor:
         task.cancel()
         return True
 
-    async def shutdown(self, *, timeout: float = 3.0) -> None:
+    def begin_shutdown(self) -> None:
         self._accepting = False
+
+    async def cancel_all(self, *, timeout: float = 3.0) -> None:
         current = asyncio.current_task()
         tasks = [
             task
@@ -83,6 +85,10 @@ class TaskSupervisor:
                 "TaskSupervisor shutdown timed out: "
                 f"tasks={names} timeout={timeout}"
             )
+
+    async def shutdown(self, *, timeout: float = 3.0) -> None:
+        self.begin_shutdown()
+        await self.cancel_all(timeout=timeout)
 
     def _on_done(self, task: asyncio.Task[Any]) -> None:
         name = self._tasks.pop(task, task.get_name())

@@ -7,14 +7,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from mewcode.tools.base import Tool, ToolResult
+from mewcode.task_supervisor import TaskSupervisor
 from mewcode.workflow.engine import WorkflowEngine, WorkflowNotFoundError
 
 log = logging.getLogger(__name__)
@@ -49,9 +50,15 @@ class WorkflowTool(Tool):
         self,
         engine: WorkflowEngine,
         task_manager: Any = None,
+        task_supervisor: TaskSupervisor | None = None,
     ) -> None:
         self._engine = engine
         self._task_manager = task_manager
+        self._task_supervisor = (
+            task_supervisor
+            or getattr(task_manager, "task_supervisor", None)
+            or TaskSupervisor()
+        )
 
     async def execute(self, params: WorkflowParams) -> ToolResult:
         # 列出可用 workflows
@@ -92,31 +99,25 @@ class WorkflowTool(Tool):
             )
 
     async def _execute_background(self, params: WorkflowParams) -> ToolResult:
-        if self._task_manager is None:
-            return ToolResult(
-                output="Background workflow execution requires TaskManager to be initialized.",
-                is_error=True,
-            )
-
         async def _bg_run() -> str:
-            try:
-                result = await self._engine.execute(
-                    workflow_name=params.workflow_name,
-                    args=params.args,
-                    budget_total=params.budget_total,
-                    resume=True,
-                )
-                return self._format_result(params.workflow_name, result)
-            except Exception as e:
-                return f"Workflow '{params.workflow_name}' failed: {e}"
+            result = await self._engine.execute(
+                workflow_name=params.workflow_name,
+                args=params.args,
+                budget_total=params.budget_total,
+                resume=True,
+            )
+            return self._format_result(params.workflow_name, result)
 
-        task = asyncio.create_task(_bg_run())
-        task_id = id(task)
+        task_id = uuid.uuid4().hex[:8]
+        self._task_supervisor.create(
+            _bg_run(),
+            name=f"workflow.{params.workflow_name}.{task_id}",
+        )
 
         return ToolResult(
             output=f"Workflow '{params.workflow_name}' started in background.\n"
                    f"Task ID: {task_id}\n"
-                   f"You will be notified when it completes."
+                   f"Completion or failure is tracked by the runtime supervisor."
         )
 
     def _format_result(self, workflow_name: str, result: Any) -> str:
