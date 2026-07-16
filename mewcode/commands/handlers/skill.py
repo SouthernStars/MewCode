@@ -74,7 +74,12 @@ async def _handle_reload(ctx: CommandContext, loader: SkillLoader) -> None:
     registry = ctx.config.get("registry")
     if registry is not None:
         from mewcode.commands.handlers.skill_register import register_skill_commands
-        register_skill_commands(registry, loader, ctx.config.get("skill_executor"))
+        register_skill_commands(
+            registry,
+            loader,
+            ctx.config.get("skill_executor"),
+            task_supervisor=ctx.config.get("task_supervisor"),
+        )
 
     ctx.ui.add_system_message(f"已重新加载 {len(skills)} 个 Skill")
 

@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
+from mewcode.task_supervisor import TaskSupervisor
+
 if TYPE_CHECKING:
     from mewcode.agent import Agent
 
@@ -38,7 +40,11 @@ class BackgroundTask:
 class TaskManager:
 
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        task_supervisor: TaskSupervisor | None = None,
+    ) -> None:
+        self.task_supervisor = task_supervisor or TaskSupervisor()
         self._tasks: dict[str, BackgroundTask] = {}
         self._notify_queue: asyncio.Queue[str] = asyncio.Queue()
         self._async_tasks: dict[str, asyncio.Task[None]] = {}
@@ -60,8 +66,9 @@ class TaskManager:
         )
         self._tasks[task_id] = bg
 
-        async_task = asyncio.create_task(
-            self._run_background(task_id, fork_conversation)
+        async_task = self.task_supervisor.create(
+            self._run_background(task_id, fork_conversation),
+            name=f"agent.background.{task_id}",
         )
         self._async_tasks[task_id] = async_task
 
@@ -146,7 +153,10 @@ class TaskManager:
         )
         self._tasks[task_id] = bg
 
-        async_task = asyncio.create_task(self._continue_background(task_id))
+        async_task = self.task_supervisor.create(
+            self._continue_background(task_id),
+            name=f"agent.continue.{task_id}",
+        )
         self._async_tasks[task_id] = async_task
         bg.cancel = async_task.cancel
         return task_id
@@ -186,8 +196,7 @@ class TaskManager:
             return False
         async_task = self._async_tasks.get(task_id)
         if async_task and not async_task.done():
-            async_task.cancel()
-            return True
+            return self.task_supervisor.cancel(async_task)
         return False
 
     def poll_completed(self) -> list[BackgroundTask]:

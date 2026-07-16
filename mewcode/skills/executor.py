@@ -102,6 +102,7 @@ class SkillExecutor:
             max_iterations=self.agent.max_iterations,
             permission_checker=None,
             context_window=self.agent.context_window,
+            task_supervisor=self.agent.task_supervisor,
         )
 
         result_parts: list[str] = []

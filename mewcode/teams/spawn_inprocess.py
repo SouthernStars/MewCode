@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
+from mewcode.task_supervisor import TaskSupervisor
 from mewcode.teams.progress import TeammateProgress, random_verb
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ def spawn_inprocess_teammate(
     conversation: ConversationManager | None = None,
     member: TeammateInfo | None = None,
     team_name: str = "",
+    task_supervisor: TaskSupervisor | None = None,
 ) -> InProcessTeammateHandle:
 
     # Create progress tracker and attach to member if provided
@@ -103,6 +105,14 @@ def spawn_inprocess_teammate(
             progress.status = "failed"
             raise
 
-    task = asyncio.create_task(_run(), name=f"teammate-{name}")
+    supervisor = (
+        task_supervisor
+        or getattr(agent, "task_supervisor", None)
+        or TaskSupervisor(agent_id=agent.agent_id)
+    )
+    task = supervisor.create(
+        _run(),
+        name=f"teammate.{name}",
+    )
     log.info("Spawned in-process teammate %s (verb=%s)", name, progress.spinner_verb)
     return InProcessTeammateHandle(agent=agent, task=task, name=name, progress=progress)

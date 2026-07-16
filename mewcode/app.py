@@ -698,7 +698,10 @@ class MewCodeApp(App):
         )
 
         register_skill_commands(
-            self.command_registry, self.skill_loader, self.skill_executor
+            self.command_registry,
+            self.skill_loader,
+            self.skill_executor,
+            task_supervisor=runtime.task_supervisor,
         )
 
         wt_command = create_worktree_command(self.worktree_manager)
@@ -847,6 +850,9 @@ class MewCodeApp(App):
                 "render_restored": self._render_restored_messages,
                 "skill_loader": self.skill_loader,
                 "skill_executor": self.skill_executor,
+                "task_supervisor": (
+                    self.runtime.task_supervisor if self.runtime else None
+                ),
             },
         )
 

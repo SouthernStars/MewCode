@@ -182,6 +182,8 @@ class Runtime:
         self.callbacks.on_mcp_ready(self.mcp_errors, self.mcp_instructions)
 
     async def shutdown(self) -> None:
+        self.task_supervisor.begin_shutdown()
+
         if self._stale_cleanup_task and not self._stale_cleanup_task.done():
             self.task_supervisor.cancel(self._stale_cleanup_task)
             try:
@@ -192,18 +194,13 @@ class Runtime:
 
         await self.scheduler_runtime.shutdown()
         await self.mcp_manager.shutdown()
-        await self.task_supervisor.shutdown()
+        await self.task_supervisor.cancel_all()
 
         if self.agent.memory_manager:
             try:
                 await self.agent._extract_memories(self.conversation)
             except Exception:
                 log.error("Runtime memory extraction failed during shutdown", exc_info=True)
-
-        if self.agent.hook_engine:
-            await self.agent.hook_engine.run_hooks(
-                "shutdown", HookContext(event_name="shutdown")
-            )
 
         if self.evolution_manager is not None:
             try:
@@ -222,6 +219,14 @@ class Runtime:
             except Exception:
                 log.error("Team cleanup failed for %s", name, exc_info=True)
 
+        if self.agent.hook_engine:
+            await self.agent.hook_engine.run_hooks(
+                "shutdown",
+                HookContext(event_name="shutdown"),
+                wait_for_async=True,
+            )
+
+        await self.task_supervisor.shutdown()
         self.session.close()
         self._started = False
 
@@ -271,6 +276,9 @@ class RuntimeBuilder:
             mode=self.settings.permission_mode,
         )
         instructions = load_instructions(self.work_dir)
+        task_supervisor = TaskSupervisor(session_id=session.session_id)
+        if self.hook_engine is not None:
+            self.hook_engine.bind_task_supervisor(task_supervisor)
 
         agent = Agent(
             client=client,
@@ -282,13 +290,11 @@ class RuntimeBuilder:
             instructions_content=instructions,
             memory_manager=memory_manager,
             hook_engine=self.hook_engine,
+            task_supervisor=task_supervisor,
         )
         agent.file_history = file_history
         agent.session_id = session.session_id
-        task_supervisor = TaskSupervisor(
-            session_id=session.session_id,
-            agent_id=agent.agent_id,
-        )
+        task_supervisor.agent_id = agent.agent_id
 
         load_skill_tool = LoadSkill()
         registry.register(load_skill_tool)
@@ -329,7 +335,7 @@ class RuntimeBuilder:
         registry.register(EnterWorktreeTool(worktree_manager=worktree_manager))
         registry.register(ExitWorktreeTool(worktree_manager=worktree_manager))
 
-        task_manager = TaskManager()
+        task_manager = TaskManager(task_supervisor=task_supervisor)
         trace_manager = TraceManager()
         agent_loader = AgentLoader(
             self.work_dir,
@@ -377,7 +383,11 @@ class RuntimeBuilder:
             on_log=self.callbacks.on_workflow_log,
         )
         registry.register(
-            WorkflowTool(engine=workflow_engine, task_manager=task_manager)
+            WorkflowTool(
+                engine=workflow_engine,
+                task_manager=task_manager,
+                task_supervisor=task_supervisor,
+            )
         )
         registry.register(ListWorkflowsTool(engine=workflow_engine))
         agent.workflow_engine = workflow_engine
