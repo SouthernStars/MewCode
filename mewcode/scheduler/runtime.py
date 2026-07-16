@@ -13,6 +13,7 @@ from typing import Callable
 
 from mewcode.scheduler.store import CronJob, CronStore
 from mewcode.scheduler.wakeup import WakeupScheduler
+from mewcode.task_supervisor import TaskSupervisor
 
 log = logging.getLogger(__name__)
 
@@ -35,10 +36,13 @@ class SchedulerRuntime:
         wakeup_scheduler: WakeupScheduler | None = None,
         *,
         on_fire: Callable[[CronJob], None] | None = None,
+        task_supervisor: TaskSupervisor | None = None,
     ) -> None:
         self._store = cron_store
         self._wakeup = wakeup_scheduler
         self._on_fire = on_fire
+        self._task_supervisor = task_supervisor or TaskSupervisor()
+        self._owns_task_supervisor = task_supervisor is None
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -51,19 +55,24 @@ class SchedulerRuntime:
         if self._running:
             return
         self._running = True
-        self._task = asyncio.create_task(self._loop())
+        self._task = self._task_supervisor.create(
+            self._loop(),
+            name="scheduler.loop",
+        )
         log.info("[scheduler] runtime started (interval=%ds)", _CHECK_INTERVAL)
 
     async def shutdown(self) -> None:
         """优雅关闭。"""
         self._running = False
         if self._task:
-            self._task.cancel()
+            self._task_supervisor.cancel(self._task)
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._owns_task_supervisor:
+            await self._task_supervisor.shutdown()
         log.info("[scheduler] runtime shutdown complete")
 
     # ------------------------------------------------------------------

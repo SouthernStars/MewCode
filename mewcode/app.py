@@ -712,7 +712,10 @@ class MewCodeApp(App):
         self.command_registry.register_sync(trace_cmd)
 
         self._mcp_connecting = bool(runtime.settings.mcp_servers)
-        self._runtime_start_task = asyncio.create_task(runtime.start())
+        self._runtime_start_task = runtime.task_supervisor.create(
+            runtime.start(),
+            name="runtime.start",
+        )
 
         self.query_one("#model-label", Static).update(provider.model)
         work_dir = os.getcwd()
@@ -731,8 +734,9 @@ class MewCodeApp(App):
         chat_input.load_history(work_dir)
         chat_input.focus()
 
-        self._notification_check_task = asyncio.create_task(
-            self._start_notification_polling()
+        self._notification_check_task = runtime.task_supervisor.create(
+            self._start_notification_polling(),
+            name="ui.notification_poll",
         )
 
     def _adopt_runtime(self, runtime: Runtime) -> None:
@@ -1280,12 +1284,14 @@ class MewCodeApp(App):
                             self.agent.total_input_tokens
                             + self.agent.total_output_tokens
                         )
-                        asyncio.ensure_future(
-                            self._update_session_summary()
+                        self.runtime.task_supervisor.create(
+                            self._update_session_summary(),
+                            name="session.summary",
                         )
                     if self.agent.plan_mode:
-                        asyncio.ensure_future(
-                            self._show_plan_approval()
+                        self.runtime.task_supervisor.create(
+                            self._show_plan_approval(),
+                            name="ui.plan_approval",
                         )
 
             # 收尾：渲染剩余的累积文本
