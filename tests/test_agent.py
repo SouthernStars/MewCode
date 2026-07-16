@@ -5,6 +5,7 @@ import asyncio
 from typing import Any, AsyncIterator
 
 import pytest
+from pydantic import BaseModel
 
 from mewcode.agent import (
     Agent,
@@ -28,7 +29,9 @@ from mewcode.tools.base import (
     StreamEnd,
     StreamEvent,
     TextDelta,
+    Tool,
     ToolCallComplete,
+    ToolResult,
 )
 
 # ---------------------------------------------------------------------------
@@ -348,6 +351,215 @@ async def test_concurrent_batch_execution():
     assert len(c["tool_result"]) == 2
     # 两个都应成功（这些文件在项目根目录下存在）
     assert all(not r.is_error for r in c["tool_result"])
+
+
+@pytest.mark.asyncio
+async def test_concurrent_safe_tools_still_require_permission(tmp_path):
+    """并发安全只描述执行方式，不能绕过写工具的权限审批。"""
+    from mewcode.permissions import (
+        DangerousCommandDetector,
+        PathSandbox,
+        PermissionChecker,
+        PermissionMode,
+        RuleEngine,
+    )
+
+    class EmptyParams(BaseModel):
+        pass
+
+    class ConcurrentWriteTool(Tool):
+        name = "ConcurrentWrite"
+        description = "test concurrent write"
+        params_model = EmptyParams
+        category = "write"
+        is_concurrency_safe = True
+
+        def __init__(self) -> None:
+            self.executions = 0
+
+        async def execute(self, params: EmptyParams) -> ToolResult:
+            self.executions += 1
+            return ToolResult(output="written")
+
+    tool = ConcurrentWriteTool()
+    registry = create_default_registry()
+    registry.register(tool)
+    checker = PermissionChecker(
+        detector=DangerousCommandDetector(),
+        sandbox=PathSandbox(str(tmp_path)),
+        rule_engine=RuleEngine(),
+        mode=PermissionMode.DEFAULT,
+    )
+    client = MockLLMClient([
+        [
+            ToolCallComplete("t1", tool.name, {}),
+            ToolCallComplete("t2", tool.name, {}),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+        [
+            TextDelta("Both writes were denied."),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+    ])
+    agent = Agent(
+        client,
+        registry,
+        "anthropic",
+        work_dir=str(tmp_path),
+        permission_checker=checker,
+    )
+
+    events = []
+    async for event in agent.run(ConversationManager()):
+        events.append(event)
+        if isinstance(event, PermissionRequest):
+            event.future.set_result(PermissionResponse.DENY)
+
+    collected = _collect(events)
+    assert len([e for e in events if isinstance(e, PermissionRequest)]) == 2
+    assert tool.executions == 0
+    assert len(collected["tool_result"]) == 2
+    assert all(result.is_error for result in collected["tool_result"])
+
+
+@pytest.mark.asyncio
+async def test_policy_approved_tools_still_execute_concurrently():
+    """统一前置检查后，获批的并发安全工具仍并行执行。"""
+
+    class EmptyParams(BaseModel):
+        pass
+
+    class BarrierTool(Tool):
+        name = "BarrierTool"
+        description = "wait for both calls"
+        params_model = EmptyParams
+        category = "read"
+        is_concurrency_safe = True
+
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.release = asyncio.Event()
+
+        async def execute(self, params: EmptyParams) -> ToolResult:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == 2:
+                self.release.set()
+            await asyncio.wait_for(self.release.wait(), timeout=1)
+            self.active -= 1
+            return ToolResult(output="ok")
+
+    tool = BarrierTool()
+    registry = create_default_registry()
+    registry.register(tool)
+    client = MockLLMClient([
+        [
+            ToolCallComplete("t1", tool.name, {}),
+            ToolCallComplete("t2", tool.name, {}),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+        [TextDelta("done"), StreamEnd("end_turn", input_tokens=1, output_tokens=1)],
+    ])
+    agent = Agent(client, registry, "anthropic")
+
+    async def consume() -> None:
+        async for _event in agent.run(ConversationManager()):
+            pass
+
+    await asyncio.wait_for(consume(), timeout=2)
+    assert tool.max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_pipeline_records_audit_and_metrics_in_order():
+    """串行工具也由同一管线完成 Hook、限流、权限、审计和指标。"""
+    from mewcode.permissions import Decision, PermissionMode
+
+    order: list[str] = []
+
+    class EmptyParams(BaseModel):
+        pass
+
+    class OrderedTool(Tool):
+        name = "OrderedTool"
+        description = "record execution order"
+        params_model = EmptyParams
+        category = "write"
+
+        async def execute(self, params: EmptyParams) -> ToolResult:
+            order.append("execute")
+            return ToolResult(output="ok")
+
+    class Hooks:
+        async def run_hooks(self, event: str, context) -> None:
+            if event == "pre_tool_use":
+                order.append("pre_hook")
+            elif event == "post_tool_use":
+                order.append("post_hook")
+
+        async def run_pre_tool_hooks(self, context):
+            order.append("pre_hook")
+            return None
+
+        def drain_notifications(self) -> list:
+            return []
+
+        def get_prompt_messages(self) -> list[str]:
+            return []
+
+    class Limiter:
+        def acquire(self, tool_name: str) -> bool:
+            order.append("rate_limit")
+            return True
+
+    class Checker:
+        mode = PermissionMode.BYPASS
+
+        def check(self, tool: Tool, arguments: dict[str, Any]) -> Decision:
+            order.append("permission")
+            return Decision(effect="allow", reason="test")
+
+    class Audit:
+        def log_decision(self, **kwargs: Any) -> None:
+            order.append(f"audit:{kwargs['decision']}")
+
+    class Metrics:
+        def record_tool_call(self, latency_ms: float) -> None:
+            order.append("metrics")
+
+    registry = create_default_registry()
+    registry.register(OrderedTool())
+    client = MockLLMClient([
+        [
+            ToolCallComplete("t1", "OrderedTool", {}),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+        [TextDelta("done"), StreamEnd("end_turn", input_tokens=1, output_tokens=1)],
+    ])
+    agent = Agent(
+        client,
+        registry,
+        "anthropic",
+        permission_checker=Checker(),
+        hook_engine=Hooks(),
+        rate_limiter=Limiter(),
+        audit_logger=Audit(),
+        metrics_collector=Metrics(),
+    )
+
+    async for _event in agent.run(ConversationManager()):
+        pass
+
+    assert order == [
+        "pre_hook",
+        "rate_limit",
+        "permission",
+        "execute",
+        "post_hook",
+        "audit:allow",
+        "metrics",
+    ]
 
 @pytest.mark.asyncio
 async def test_token_usage_accumulates():
