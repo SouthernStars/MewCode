@@ -114,6 +114,19 @@ async def _finish_readers(
         ) from exc
 
 
+async def _cancel_readers(
+    stdout_task: asyncio.Task[tuple[bytes, bool]],
+    stderr_task: asyncio.Task[tuple[bytes, bool]],
+) -> None:
+    stdout_task.cancel()
+    stderr_task.cancel()
+    await asyncio.gather(
+        stdout_task,
+        stderr_task,
+        return_exceptions=True,
+    )
+
+
 def _render_output(
     stdout: bytes,
     stderr: bytes,
@@ -188,14 +201,14 @@ class Bash(Tool):
             await asyncio.wait_for(proc.wait(), timeout=params.timeout)
         except asyncio.TimeoutError:
             await _terminate_process_tree(proc)
-            await _finish_readers(proc, stdout_task, stderr_task)
+            await _cancel_readers(stdout_task, stderr_task)
             return ToolResult(
                 output=f"Error: command timed out after {params.timeout}s",
                 is_error=True,
             )
         except asyncio.CancelledError:
             await _terminate_process_tree(proc)
-            await _finish_readers(proc, stdout_task, stderr_task)
+            await _cancel_readers(stdout_task, stderr_task)
             raise
 
         (stdout, stdout_truncated), (stderr, stderr_truncated) = (
