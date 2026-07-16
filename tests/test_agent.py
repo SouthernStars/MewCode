@@ -453,6 +453,187 @@ async def test_plan_mode_denied_tool_returns_error():
     assert "denied" in c["tool_result"][0].output.lower() or "拒绝" in c["tool_result"][0].output
     assert len(c["error"]) == 0
 
+
+@pytest.mark.asyncio
+async def test_run_to_completion_uses_the_same_rate_limit_pipeline(tmp_path):
+    """非交互适配器不能绕过流式循环中的限流检查。"""
+
+    class RejectingRateLimiter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def acquire(self, tool_name: str) -> bool:
+            self.calls.append(tool_name)
+            return False
+
+        def get_status_text(self, tool_name: str) -> str:
+            return f"blocked {tool_name}"
+
+    target = tmp_path / "must-not-exist.txt"
+    client = MockLLMClient([
+        [
+            ToolCallComplete(
+                "t1",
+                "WriteFile",
+                {"file_path": str(target), "content": "unsafe"},
+            ),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=10),
+        ],
+        [
+            TextDelta("The write was blocked."),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=10),
+        ],
+    ])
+    limiter = RejectingRateLimiter()
+    agent = Agent(
+        client,
+        create_default_registry(),
+        "anthropic",
+        work_dir=str(tmp_path),
+        rate_limiter=limiter,
+    )
+
+    result = await agent.run_to_completion("write the file")
+
+    assert result == "The write was blocked."
+    assert limiter.calls == ["WriteFile"]
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_uses_the_full_hook_lifecycle():
+    """收集式适配器与流式入口共享 session/turn Hook 生命周期。"""
+
+    class RecordingHookEngine:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def run_hooks(self, event: str, context) -> None:
+            self.events.append(event)
+
+        async def run_pre_tool_hooks(self, context):
+            return None
+
+        def drain_notifications(self) -> list:
+            return []
+
+        def get_prompt_messages(self) -> list[str]:
+            return []
+
+    hooks = RecordingHookEngine()
+    client = MockLLMClient([[
+        TextDelta("done"),
+        StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+    ]])
+    agent = Agent(
+        client,
+        create_default_registry(),
+        "anthropic",
+        hook_engine=hooks,
+    )
+
+    assert await agent.run_to_completion("work") == "done"
+    assert hooks.events == [
+        "session_start",
+        "turn_start",
+        "pre_send",
+        "post_receive",
+        "turn_end",
+        "session_end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_adapts_stream_events_for_progress_callbacks():
+    """Team 进度回调继续收到每轮完整文本、用量与工具调用。"""
+    client = MockLLMClient([
+        [
+            TextDelta("Reading "),
+            TextDelta("now."),
+            ToolCallComplete("t1", "ReadFile", {"file_path": "README.md"}),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=5),
+        ],
+        [
+            TextDelta("Done."),
+            StreamEnd("end_turn", input_tokens=20, output_tokens=5),
+        ],
+    ])
+    agent = Agent(client, create_default_registry(), "anthropic", work_dir=".")
+    callbacks: list[dict[str, Any]] = []
+
+    result = await agent.run_to_completion(
+        "read the readme",
+        event_callback=callbacks.append,
+    )
+
+    assert result == "Done."
+    assert callbacks == [
+        {
+            "type": "usage",
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+        },
+        {"type": "stream_text", "text": "Reading now."},
+        {
+            "type": "tool_use",
+            "toolName": "ReadFile",
+            "args": {"file_path": "README.md"},
+        },
+        {
+            "type": "usage",
+            "usage": {"inputTokens": 30, "outputTokens": 10},
+        },
+        {"type": "stream_text", "text": "Done."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_denies_unattended_permission_prompt(tmp_path):
+    """非交互适配器不能挂起等待 UI；未显式 dontAsk 时拒绝审批。"""
+    from mewcode.permissions import (
+        DangerousCommandDetector,
+        PathSandbox,
+        PermissionChecker,
+        PermissionMode,
+        RuleEngine,
+    )
+
+    target = tmp_path / "denied.txt"
+    client = MockLLMClient([
+        [
+            ToolCallComplete(
+                "t1",
+                "WriteFile",
+                {"file_path": str(target), "content": "denied"},
+            ),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+        [
+            TextDelta("Permission was denied."),
+            StreamEnd("end_turn", input_tokens=1, output_tokens=1),
+        ],
+    ])
+    checker = PermissionChecker(
+        detector=DangerousCommandDetector(),
+        sandbox=PathSandbox(str(tmp_path)),
+        rule_engine=RuleEngine(),
+        mode=PermissionMode.PLAN,
+    )
+    agent = Agent(
+        client,
+        create_default_registry(),
+        "anthropic",
+        work_dir=str(tmp_path),
+        permission_checker=checker,
+    )
+
+    result = await asyncio.wait_for(
+        agent.run_to_completion("write the file"),
+        timeout=2,
+    )
+
+    assert result == "Permission was denied."
+    assert not target.exists()
+
 def test_partition_tool_calls():
     """分批逻辑会把可并发执行的调用归到同一组。"""
     from mewcode.tools.base import ToolCallComplete
