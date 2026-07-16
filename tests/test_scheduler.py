@@ -75,6 +75,8 @@ async def test_runtime_start_and_shutdown(tmp_path: Path) -> None:
     runtime = SchedulerRuntime(CronStore(str(tmp_path)))
     await runtime.start()
     assert runtime._running is True
+    assert runtime._task is not None
+    assert runtime._task.get_name() == "scheduler.loop"
     await runtime.shutdown()
     assert runtime._running is False
     assert runtime._task is None

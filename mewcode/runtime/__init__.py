@@ -7,6 +7,7 @@ from mewcode.runtime.config import (
     RuntimeProviderSettings,
     RuntimeSettings,
 )
+from mewcode.task_supervisor import TaskSupervisor
 
 __all__ = [
     "Runtime",
@@ -18,4 +19,5 @@ __all__ = [
     "RuntimeMCPServerSettings",
     "RuntimeProviderSettings",
     "RuntimeSettings",
+    "TaskSupervisor",
 ]

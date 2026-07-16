@@ -53,6 +53,7 @@ from mewcode.scheduler.wakeup import WakeupScheduler
 from mewcode.skills.executor import SkillExecutor
 from mewcode.skills.loader import SkillLoader
 from mewcode.teams.manager import TeamManager
+from mewcode.task_supervisor import TaskSupervisor
 from mewcode.tools import ToolRegistry, create_default_registry
 from mewcode.tools.agent_tool import AgentTool
 from mewcode.tools.ask_user import AskUserTool
@@ -88,6 +89,7 @@ class Runtime:
     settings: RuntimeSettings
     capabilities: RuntimeCapabilities
     callbacks: RuntimeCallbacks
+    task_supervisor: TaskSupervisor
     work_dir: str
     provider: ProviderConfig
     client: LLMClient
@@ -144,12 +146,13 @@ class Runtime:
         if self.capabilities.scheduler:
             await self.scheduler_runtime.start()
 
-        self._stale_cleanup_task = asyncio.create_task(
+        self._stale_cleanup_task = self.task_supervisor.create(
             start_stale_cleanup_task(
                 self.worktree_manager,
                 self.settings.worktree_stale_cleanup_interval,
                 self.settings.worktree_stale_cutoff_hours,
-            )
+            ),
+            name="worktree.stale_cleanup",
         )
 
         if self.capabilities.mcp and self.settings.mcp_servers:
@@ -180,7 +183,7 @@ class Runtime:
 
     async def shutdown(self) -> None:
         if self._stale_cleanup_task and not self._stale_cleanup_task.done():
-            self._stale_cleanup_task.cancel()
+            self.task_supervisor.cancel(self._stale_cleanup_task)
             try:
                 await self._stale_cleanup_task
             except asyncio.CancelledError:
@@ -189,6 +192,7 @@ class Runtime:
 
         await self.scheduler_runtime.shutdown()
         await self.mcp_manager.shutdown()
+        await self.task_supervisor.shutdown()
 
         if self.agent.memory_manager:
             try:
@@ -281,6 +285,10 @@ class RuntimeBuilder:
         )
         agent.file_history = file_history
         agent.session_id = session.session_id
+        task_supervisor = TaskSupervisor(
+            session_id=session.session_id,
+            agent_id=agent.agent_id,
+        )
 
         load_skill_tool = LoadSkill()
         registry.register(load_skill_tool)
@@ -386,6 +394,7 @@ class RuntimeBuilder:
             cron_store=cron_store,
             wakeup_scheduler=wakeup_scheduler,
             on_fire=on_scheduled_fire,
+            task_supervisor=task_supervisor,
         )
         registry.register(CronCreateTool(cron_store))
         registry.register(CronDeleteTool(cron_store))
@@ -462,6 +471,7 @@ class RuntimeBuilder:
             settings=self.settings,
             capabilities=self.capabilities,
             callbacks=self.callbacks,
+            task_supervisor=task_supervisor,
             work_dir=self.work_dir,
             provider=provider,
             client=client,

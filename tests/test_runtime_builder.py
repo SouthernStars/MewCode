@@ -176,6 +176,9 @@ async def test_tui_adopts_builder_runtime(tmp_path: Path, monkeypatch) -> None:
             assert app.team_manager is app.runtime.team_manager
             assert app.workflow_engine is app.runtime.workflow_engine
             assert app.scheduler_runtime is app.runtime.scheduler_runtime
+            assert "ui.notification_poll" in (
+                app.runtime.task_supervisor.active_names
+            )
             await app.runtime.shutdown()
 
 
@@ -205,6 +208,10 @@ async def test_runtime_lifecycle_and_scheduler_injection(tmp_path: Path) -> None
     await runtime.start()
     assert runtime.scheduler_runtime._running is True
     assert runtime._stale_cleanup_task is not None
+    assert set(runtime.task_supervisor.active_names) == {
+        "scheduler.loop",
+        "worktree.stale_cleanup",
+    }
 
     runtime.scheduler_runtime._on_fire(
         CronJob(id="job-1", cron="* * * * *", prompt="continue")
@@ -217,4 +224,5 @@ async def test_runtime_lifecycle_and_scheduler_injection(tmp_path: Path) -> None
     await runtime.shutdown()
     assert runtime.scheduler_runtime._running is False
     assert runtime._stale_cleanup_task is None
+    assert runtime.task_supervisor.active_names == ()
     assert runtime.session._file.closed is True
