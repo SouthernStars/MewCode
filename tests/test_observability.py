@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from mewcode.observability import (
+    EventMetricsAggregator,
     EventType,
     JsonlEventSink,
     RuntimeEvent,
@@ -58,3 +59,39 @@ def test_jsonl_event_sink_persists_events(tmp_path: Path) -> None:
     sink(event)
 
     assert read_jsonl_records(path, format_name="runtime events") == [event.to_dict()]
+
+
+def test_event_metrics_aggregate_core_quality_signals(tmp_path: Path) -> None:
+    metrics = EventMetricsAggregator(session_id="session-1")
+    metrics(RuntimeEvent(EventType.LLM_REQUEST, session_id="session-1"))
+    metrics(
+        RuntimeEvent(
+            EventType.LLM_RESPONSE,
+            session_id="session-1",
+            payload={"input_tokens": 10, "output_tokens": 5},
+        )
+    )
+    metrics(
+        RuntimeEvent(
+            EventType.TOOL_RESULT,
+            session_id="session-1",
+            payload={"is_error": False, "elapsed": 12.0},
+        )
+    )
+    metrics(
+        RuntimeEvent(
+            EventType.PERMISSION_DECISION,
+            session_id="session-1",
+            payload={"decision": "deny"},
+        )
+    )
+
+    snapshot_path = tmp_path / "metrics.json"
+    metrics.save(snapshot_path)
+    snapshot = metrics.snapshot()
+
+    assert snapshot["event_count"] == 4
+    assert snapshot["total_tokens"] == 15
+    assert snapshot["tool_success_rate"] == 1.0
+    assert snapshot["permission_denials"] == 1
+    assert snapshot_path.exists()

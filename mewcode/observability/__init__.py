@@ -6,5 +6,12 @@ from mewcode.observability.events import (
     RuntimeEvent,
     RuntimeEventBus,
 )
+from mewcode.observability.metrics import EventMetricsAggregator
 
-__all__ = ["EventType", "JsonlEventSink", "RuntimeEvent", "RuntimeEventBus"]
+__all__ = [
+    "EventMetricsAggregator",
+    "EventType",
+    "JsonlEventSink",
+    "RuntimeEvent",
+    "RuntimeEventBus",
+]
