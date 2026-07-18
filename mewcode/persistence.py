@@ -172,6 +172,99 @@ def atomic_write_json(
     atomic_write_text(path, content, format_name=format_name)
 
 
+def append_jsonl_record(
+    path: str | Path,
+    data: Any,
+    *,
+    format_name: str,
+) -> None:
+    """Append one JSONL record with a durable flush under the file lock."""
+
+    target = Path(path)
+    try:
+        line = json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise PersistenceError(
+            f"Failed to serialize {format_name} for {target}: {exc}"
+        ) from exc
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(target, format_name=format_name):
+            with open(target, "a", encoding="utf-8", newline="") as stream:
+                stream.write(line)
+                stream.flush()
+                os.fsync(stream.fileno())
+    except OSError as exc:
+        raise PersistenceError(
+            f"Failed to append {format_name} at {target}: {exc}"
+        ) from exc
+
+
+def read_jsonl_records(
+    path: str | Path,
+    *,
+    format_name: str,
+) -> list[Any]:
+    """Read JSONL fail-fast, recovering only an incomplete final line.
+
+    A malformed interior line (or a malformed final line terminated by a
+    newline) is treated as corruption.  A final unterminated malformed line
+    is assumed to be a crash-interrupted append and is truncated.
+    """
+
+    target = Path(path)
+    if not target.exists():
+        return []
+
+    try:
+        with file_lock(target, format_name=format_name):
+            raw = target.read_bytes()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise PersistenceError(
+                    f"Failed to decode {format_name} at {target}: {exc}"
+                ) from exc
+
+            records: list[Any] = []
+            offset = 0
+            chunks = text.splitlines(keepends=True)
+            for index, chunk in enumerate(chunks):
+                has_newline = chunk.endswith(("\n", "\r"))
+                line = chunk.strip()
+                next_offset = offset + len(chunk.encode("utf-8"))
+                offset = next_offset
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    is_final = index == len(chunks) - 1
+                    if is_final and not has_newline:
+                        try:
+                            with open(target, "r+b") as stream:
+                                stream.truncate(next_offset - len(chunk.encode("utf-8")))
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                        except OSError as truncate_error:
+                            raise PersistenceError(
+                                f"Failed to recover incomplete {format_name} at "
+                                f"{target}: {truncate_error}"
+                            ) from truncate_error
+                        break
+                    raise PersistenceError(
+                        f"Corrupted {format_name} line {index + 1} at {target}: {exc}"
+                    ) from exc
+            return records
+    except PersistenceError:
+        raise
+    except OSError as exc:
+        raise PersistenceError(
+            f"Failed to read {format_name} at {target}: {exc}"
+        ) from exc
+
+
 def _read_json(path: Path, *, format_name: str) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))

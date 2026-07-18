@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from mewcode.harness.evolution.models import ExecutionTrace
+from mewcode.persistence import PersistenceError, append_jsonl_record, read_jsonl_records
 
 log = logging.getLogger(__name__)
 
@@ -38,11 +39,7 @@ class ExecutionTraceStore:
         """追加一条执行轨迹。"""
         date_str = time.strftime("%Y%m%d", time.localtime(trace.timestamp))
         file_path = self._traces_dir / f"{date_str}.jsonl"
-        try:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(trace.to_dict(), ensure_ascii=False) + "\n")
-        except OSError as e:
-            log.error("[trace_store] failed to append trace %s: %s", trace.trace_id, e)
+        append_jsonl_record(file_path, trace.to_dict(), format_name="execution trace")
 
     def append_batch(self, traces: list[ExecutionTrace]) -> None:
         """批量追加执行轨迹。"""
@@ -146,6 +143,22 @@ class ExecutionTraceStore:
 
     @staticmethod
     def _read_file_forward(file_path: Path) -> list[ExecutionTrace]:
+        traces: list[ExecutionTrace] = []
+        for data in read_jsonl_records(file_path, format_name="execution trace"):
+            if not isinstance(data, dict):
+                raise PersistenceError(
+                    f"Invalid execution trace at {file_path}: expected JSON object"
+                )
+            try:
+                traces.append(ExecutionTrace.from_dict(data))
+            except (TypeError, ValueError, KeyError) as exc:
+                raise PersistenceError(
+                    f"Invalid execution trace at {file_path}: {exc}"
+                ) from exc
+        return traces
+
+    @staticmethod
+    def _read_file_forward_legacy(file_path: Path) -> list[ExecutionTrace]:
         """从文件头顺序读取所有轨迹。"""
         traces: list[ExecutionTrace] = []
         try:
@@ -165,6 +178,10 @@ class ExecutionTraceStore:
 
     @staticmethod
     def _read_file_reverse(file_path: Path, limit: int) -> list[ExecutionTrace]:
+        return list(reversed(ExecutionTraceStore._read_file_forward(file_path)))[:limit]
+
+    @staticmethod
+    def _read_file_reverse_legacy(file_path: Path, limit: int) -> list[ExecutionTrace]:
         """从文件尾反向读取最多 limit 条轨迹。"""
         traces: list[ExecutionTrace] = []
         try:
@@ -188,6 +205,10 @@ class ExecutionTraceStore:
 
     @staticmethod
     def _count_lines(file_path: Path) -> int:
+        return len(read_jsonl_records(file_path, format_name="execution trace"))
+
+    @staticmethod
+    def _count_lines_legacy(file_path: Path) -> int:
         try:
             with open(file_path, encoding="utf-8") as f:
                 return sum(1 for _ in f)

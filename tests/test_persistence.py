@@ -12,8 +12,10 @@ from mewcode.persistence import (
     PersistenceError,
     UnsupportedSchemaVersionError,
     atomic_write_json,
+    append_jsonl_record,
     file_lock,
     load_versioned_json,
+    read_jsonl_records,
 )
 
 
@@ -102,3 +104,20 @@ def test_versioned_loader_reports_corrupted_json(tmp_path: Path) -> None:
             migrations={},
             format_name="state snapshot",
         )
+
+
+def test_jsonl_recovers_only_incomplete_final_line(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    append_jsonl_record(path, {"id": 1}, format_name="events")
+    path.write_bytes(path.read_bytes() + b'{"id": 2')
+
+    assert read_jsonl_records(path, format_name="events") == [{"id": 1}]
+    assert path.read_text(encoding="utf-8") == '{"id":1}\n'
+
+
+def test_jsonl_interior_corruption_fails_fast(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"id":1}\n{broken}\n{"id":3}\n', encoding="utf-8")
+
+    with pytest.raises(PersistenceError, match="Corrupted events line 2"):
+        read_jsonl_records(path, format_name="events")
