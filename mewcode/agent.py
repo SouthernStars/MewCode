@@ -30,6 +30,7 @@ from mewcode.context import (
 from mewcode.conversation import ConversationManager, ToolResultBlock, ToolUseBlock
 from mewcode.conversation import ThinkingBlock as ConvThinkingBlock
 from mewcode.memory.auto_memory import MemoryManager
+from mewcode.observability import EventType, RuntimeEventBus
 from mewcode.permissions import (
     PermissionChecker,
     PermissionMode,
@@ -292,6 +293,7 @@ class Agent:
         rate_limiter: Any = None,
         metrics_collector: Any = None,
         task_supervisor: TaskSupervisor | None = None,
+        event_bus: RuntimeEventBus | None = None,
     ) -> None:
         self.client = client
         self.protocol = protocol
@@ -348,6 +350,26 @@ class Agent:
         self.audit_logger = audit_logger
         self.rate_limiter = rate_limiter
         self.metrics_collector = metrics_collector
+        self.event_bus = event_bus
+
+    def _emit_runtime_event(
+        self,
+        event_type: EventType,
+        *,
+        tool_call_id: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.emit(
+            event_type,
+            session_id=self.session_id,
+            run_id=self.trace_id or "",
+            agent_id=self.agent_id,
+            parent_agent_id=self.parent_id or "",
+            tool_call_id=tool_call_id,
+            payload=payload,
+        )
 
     @property
     def _transcript_path(self) -> str:
@@ -546,11 +568,29 @@ class Agent:
                 append_replacement_records(self.session_dir, _new_records)
 
             collector = StreamCollector()
+            self._emit_runtime_event(
+                EventType.LLM_REQUEST,
+                payload={
+                    "iteration": iteration,
+                    "message_count": len(api_conv.history),
+                    "tool_count": len(tools),
+                },
+            )
             llm_stream = self.client.stream(api_conv, system=system, tools=tools)
             async for event in collector.consume(llm_stream):
                 yield event
 
             response = collector.response
+            self._emit_runtime_event(
+                EventType.LLM_RESPONSE,
+                payload={
+                    "iteration": iteration,
+                    "stop_reason": response.stop_reason,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "tool_call_count": len(response.tool_calls),
+                },
+            )
 
             if self.hook_engine:
                 ctx = self._build_hook_context("post_receive", message=response.text)
@@ -681,6 +721,14 @@ class Agent:
                 entries: list[_PreparedToolExecution | _ToolExecResult] = []
 
                 for tool_call in batch.calls:
+                    self._emit_runtime_event(
+                        EventType.TOOL_CALL,
+                        tool_call_id=tool_call.tool_id,
+                        payload={
+                            "tool_name": tool_call.tool_name,
+                            "arguments": tool_call.arguments,
+                        },
+                    )
                     entry: _PreparedToolExecution | _ToolExecResult | None = None
                     async for item in self._prepare_tool(tool_call):
                         if isinstance(item, PermissionRequest):
@@ -746,6 +794,15 @@ class Agent:
                         output=entry.result.output,
                         is_error=entry.result.is_error,
                         elapsed=entry.elapsed,
+                    )
+                    self._emit_runtime_event(
+                        EventType.TOOL_RESULT,
+                        tool_call_id=entry.tool_id,
+                        payload={
+                            "tool_name": entry.tool_name,
+                            "is_error": entry.result.is_error,
+                            "elapsed": entry.elapsed,
+                        },
                     )
 
             if consecutive_unknown >= 3:

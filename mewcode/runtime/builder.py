@@ -31,6 +31,7 @@ from mewcode.harness.tools import (
 )
 from mewcode.hooks import HookContext, HookEngine
 from mewcode.mcp import MCPManager
+from mewcode.observability import JsonlEventSink, RuntimeEventBus
 from mewcode.memory import MemoryManager, Session, SessionManager, load_instructions
 from mewcode.permissions import (
     DangerousCommandDetector,
@@ -103,6 +104,7 @@ class Runtime:
     file_history: FileHistory
     task_manager: TaskManager
     trace_manager: TraceManager
+    event_bus: RuntimeEventBus
     skill_loader: SkillLoader
     skill_executor: SkillExecutor
     load_skill_tool: LoadSkill
@@ -339,6 +341,13 @@ class RuntimeBuilder:
         registry.register(ExitWorktreeTool(worktree_manager=worktree_manager))
 
         task_manager = TaskManager(task_supervisor=task_supervisor)
+        event_bus = RuntimeEventBus()
+        event_bus.subscribe(
+            JsonlEventSink(
+                str(Path(self.work_dir) / ".mewcode" / "events" / f"{session.session_id}.jsonl")
+            )
+        )
+        agent.event_bus = event_bus
         trace_manager = TraceManager()
         agent_loader = AgentLoader(
             self.work_dir,
@@ -498,6 +507,7 @@ class RuntimeBuilder:
             file_history=file_history,
             task_manager=task_manager,
             trace_manager=trace_manager,
+            event_bus=event_bus,
             skill_loader=skill_loader,
             skill_executor=skill_executor,
             load_skill_tool=load_skill_tool,
