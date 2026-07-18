@@ -181,18 +181,17 @@ def _read_json(path: Path, *, format_name: str) -> Any:
         ) from exc
 
 
-def load_versioned_json(
+def read_versioned_json(
     path: str | Path,
     *,
     current_version: int,
     migrations: Mapping[int, Migration],
     format_name: str,
 ) -> dict[str, Any]:
-    """Read and migrate a JSON snapshot to ``current_version`` in memory."""
+    """Read an immutable snapshot or one synchronized by the caller."""
 
     target = Path(path)
-    with file_lock(target, format_name=format_name):
-        data = _read_json(target, format_name=format_name)
+    data = _read_json(target, format_name=format_name)
 
     if isinstance(data, dict) and "schema_version" in data:
         version = data["schema_version"]
@@ -237,3 +236,22 @@ def load_versioned_json(
             f"Invalid {format_name} root at {target}: expected JSON object"
         )
     return data
+
+
+def load_versioned_json(
+    path: str | Path,
+    *,
+    current_version: int,
+    migrations: Mapping[int, Migration],
+    format_name: str,
+) -> dict[str, Any]:
+    """Read and migrate a JSON snapshot under its cross-process lock."""
+
+    target = Path(path)
+    with file_lock(target, format_name=format_name):
+        return read_versioned_json(
+            target,
+            current_version=current_version,
+            migrations=migrations,
+            format_name=format_name,
+        )
