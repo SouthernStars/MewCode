@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mewcode.persistence import (
+    PersistenceError,
+    atomic_write_json,
+    file_lock,
+    read_versioned_json,
+)
+
+MAILBOX_SCHEMA_VERSION = 1
 
 @dataclass
 class MailboxMessage:
@@ -40,41 +47,41 @@ class Mailbox:
         d = self._agent_dir(agent_id)
         d.mkdir(parents=True, exist_ok=True)
         filename = f"{message.timestamp:.6f}_{message.id}.json"
-        (d / filename).write_text(
-            json.dumps(message.to_dict(), ensure_ascii=False),
-            encoding="utf-8",
+        atomic_write_json(
+            d / filename,
+            {"schema_version": MAILBOX_SCHEMA_VERSION, **message.to_dict()},
+            format_name="mailbox message snapshot",
         )
 
     def read(self, agent_id: str) -> list[MailboxMessage]:
         d = self._agent_dir(agent_id)
         if not d.exists():
             return []
-        messages: list[MailboxMessage] = []
-        for f in sorted(d.iterdir()):
-            if f.suffix != ".json":
-                continue
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                messages.append(MailboxMessage.from_dict(data))
-            except (json.JSONDecodeError, KeyError):
-                continue
-        return messages
+        with file_lock(d / ".consume", format_name="mailbox consumption"):
+            messages: list[MailboxMessage] = []
+            for f in sorted(d.iterdir()):
+                if f.suffix != ".json":
+                    continue
+                messages.append(_load_message(f))
+            return messages
 
     def consume(self, agent_id: str) -> list[MailboxMessage]:
         d = self._agent_dir(agent_id)
         if not d.exists():
             return []
-        messages: list[MailboxMessage] = []
-        for f in sorted(d.iterdir()):
-            if f.suffix != ".json":
-                continue
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                messages.append(MailboxMessage.from_dict(data))
-                f.unlink()
-            except (json.JSONDecodeError, KeyError):
-                continue
-        return messages
+        with file_lock(d / ".consume", format_name="mailbox consumption"):
+            messages: list[MailboxMessage] = []
+            for f in sorted(d.iterdir()):
+                if f.suffix != ".json":
+                    continue
+                messages.append(_load_message(f))
+                try:
+                    f.unlink()
+                except OSError as exc:
+                    raise PersistenceError(
+                        f"Failed to consume mailbox message at {f}: {exc}"
+                    ) from exc
+            return messages
 
     def broadcast(
         self,
@@ -123,3 +130,24 @@ def create_message(
         timestamp=time.time(),
         metadata=metadata or {},
     )
+
+
+def _migrate_mailbox_message_v0(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise TypeError("legacy mailbox message root must be a JSON object")
+    return {**data, "schema_version": 1}
+
+
+def _load_message(path: Path) -> MailboxMessage:
+    data = read_versioned_json(
+        path,
+        current_version=MAILBOX_SCHEMA_VERSION,
+        migrations={0: _migrate_mailbox_message_v0},
+        format_name="mailbox message snapshot",
+    )
+    try:
+        return MailboxMessage.from_dict(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PersistenceError(
+            f"Invalid mailbox message snapshot at {path}: {exc}"
+        ) from exc

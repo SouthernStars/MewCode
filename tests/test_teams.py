@@ -7,7 +7,9 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -113,11 +115,26 @@ class TestModels:
         ))
         team.save()
 
+        snapshot = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        assert snapshot["schema_version"] == 1
+
         loaded = AgentTeam.load(config_path)
         assert loaded.name == "test-team"
         assert loaded.lead_agent_id == "lead-001"
         assert len(loaded.members) == 1
         assert loaded.members[0].name == "alice"
+
+        snapshot.pop("schema_version")
+        Path(config_path).write_text(json.dumps(snapshot), encoding="utf-8")
+        assert AgentTeam.load(config_path).name == "test-team"
+
+    def test_agent_team_corruption_fails_clearly(self, tmp_dir):
+        config_path = Path(tmp_dir) / "team" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("not json", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="team configuration snapshot"):
+            AgentTeam.load(str(config_path))
 
     def test_get_member(self):
         team = AgentTeam(name="t", lead_agent_id="l")
@@ -241,6 +258,39 @@ class TestSharedTaskStore:
         tasks = store2.list_tasks()
         assert len(tasks) == 1
         assert tasks[0].title == "Persisted task"
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        assert snapshot["schema_version"] == 1
+        snapshot.pop("schema_version")
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        assert SharedTaskStore(path).get("1") is not None
+
+    def test_concurrent_creates_are_one_locked_transaction(self, tmp_dir):
+        path = Path(tmp_dir) / "tasks.json"
+        SharedTaskStore(path).init_empty()
+        barrier = threading.Barrier(3)
+
+        def create(title: str) -> SharedTask:
+            store = SharedTaskStore(path)
+            barrier.wait()
+            return store.create(title=title)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(create, "First")
+            second = executor.submit(create, "Second")
+            barrier.wait()
+            created = [first.result(timeout=15), second.result(timeout=15)]
+
+        assert {task.id for task in created} == {"1", "2"}
+        assert {task.title for task in SharedTaskStore(path).list_tasks()} == {
+            "First",
+            "Second",
+        }
+
+    def test_corrupted_task_snapshot_fails_clearly(self, tmp_dir):
+        path = Path(tmp_dir) / "tasks.json"
+        path.write_text("not json", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="shared task snapshot"):
+            SharedTaskStore(path)
 
 # =====================================================================
 # 3. Mailbox
@@ -252,6 +302,10 @@ class TestMailbox:
         msg = create_message("alice", "bob", "Hello bob", summary="greeting")
         mailbox.write("bob-agent-id", msg)
 
+        message_path = next((Path(tmp_dir) / "bob-agent-id").glob("*.json"))
+        snapshot = json.loads(message_path.read_text(encoding="utf-8"))
+        assert snapshot["schema_version"] == 1
+
         messages = mailbox.consume("bob-agent-id")
         assert len(messages) == 1
         assert messages[0].content == "Hello bob"
@@ -260,6 +314,37 @@ class TestMailbox:
         # 已被消费 —— 此时应该为空
         messages2 = mailbox.consume("bob-agent-id")
         assert len(messages2) == 0
+
+    def test_mailbox_migrates_v0_and_rejects_corruption(self, tmp_dir):
+        mailbox = Mailbox(tmp_dir)
+        message = create_message("alice", "bob", "Legacy")
+        mailbox.write("bob-id", message)
+        path = next((Path(tmp_dir) / "bob-id").glob("*.json"))
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        snapshot.pop("schema_version")
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        assert mailbox.read("bob-id")[0].content == "Legacy"
+
+        path.write_text("not json", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="mailbox message snapshot"):
+            mailbox.read("bob-id")
+
+    def test_concurrent_consumers_deliver_each_message_once(self, tmp_dir):
+        mailbox = Mailbox(tmp_dir)
+        mailbox.write("bob-id", create_message("alice", "bob", "Once"))
+        barrier = threading.Barrier(3)
+
+        def consume() -> list[MailboxMessage]:
+            barrier.wait()
+            return Mailbox(tmp_dir).consume("bob-id")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(consume)
+            second = executor.submit(consume)
+            barrier.wait()
+            consumed = first.result(timeout=15) + second.result(timeout=15)
+
+        assert [message.content for message in consumed] == ["Once"]
 
     def test_read_without_consume(self, tmp_dir):
         mailbox = Mailbox(tmp_dir)
@@ -532,20 +617,44 @@ class TestTranscript:
         conv.add_assistant_message("Hello user")
 
         with patch("mewcode.teams.models.Path.home", return_value=Path(tmp_dir)):
-            save_transcript("test-team", "agent-001", conv)
+            path = save_transcript("test-team", "agent-001", conv)
             restored = load_transcript("test-team", "agent-001")
+
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            assert snapshot["schema_version"] == 1
+            path.write_text(json.dumps(snapshot["messages"]), encoding="utf-8")
+            migrated = load_transcript("test-team", "agent-001")
 
         assert restored is not None
         assert len(restored.history) == 2
         assert restored.history[0].role == "user"
         assert restored.history[0].content == "Hello agent"
         assert restored.history[1].role == "assistant"
+        assert migrated is not None
+        assert len(migrated.history) == 2
 
     def test_load_nonexistent(self, tmp_dir):
         from mewcode.teams.transcript import load_transcript
         with patch("mewcode.teams.models.Path.home", return_value=Path(tmp_dir)):
             result = load_transcript("no-team", "no-agent")
         assert result is None
+
+    def test_load_corrupted_transcript_fails_clearly(self, tmp_dir):
+        from mewcode.teams.transcript import load_transcript
+
+        with patch("mewcode.teams.models.Path.home", return_value=Path(tmp_dir)):
+            path = (
+                Path(tmp_dir)
+                / ".mewcode"
+                / "teams"
+                / "test-team"
+                / "transcripts"
+                / "agent-001.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text("not json", encoding="utf-8")
+            with pytest.raises(RuntimeError, match="team transcript snapshot"):
+                load_transcript("test-team", "agent-001")
 
 # =====================================================================
 # 10. Agent build_system_prompt 集成测试

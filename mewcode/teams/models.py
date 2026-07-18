@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+from mewcode.persistence import (
+    PersistenceError,
+    atomic_write_json,
+    file_lock,
+    load_versioned_json,
+)
 from mewcode.teams.progress import TeammateProgress
+
+TEAM_SCHEMA_VERSION = 1
 
 
 class BackendType(str, Enum):
@@ -102,7 +109,14 @@ class AgentTeam:
 
     @classmethod
     def from_dict(cls, data: dict) -> AgentTeam:
-        members = [TeammateInfo.from_dict(m) for m in data.get("members", [])]
+        members_data = data.get("members", [])
+        if not isinstance(members_data, list):
+            raise TypeError("members must be a JSON array")
+        members: list[TeammateInfo] = []
+        for index, member_data in enumerate(members_data):
+            if not isinstance(member_data, dict):
+                raise TypeError(f"members[{index}] must be a JSON object")
+            members.append(TeammateInfo.from_dict(member_data))
         return cls(
             name=data["name"],
             lead_agent_id=data["lead_agent_id"],
@@ -113,15 +127,37 @@ class AgentTeam:
 
     def save(self) -> None:
         path = Path(self.config_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+        data = {"schema_version": TEAM_SCHEMA_VERSION, **self.to_dict()}
+        with file_lock(path, format_name="team configuration snapshot"):
+            atomic_write_json(
+                path,
+                data,
+                format_name="team configuration snapshot",
+            )
 
     @classmethod
     def load(cls, config_path: str) -> AgentTeam:
-        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
-        team = cls.from_dict(data)
+        path = Path(config_path)
+        data = load_versioned_json(
+            path,
+            current_version=TEAM_SCHEMA_VERSION,
+            migrations={0: _migrate_team_v0},
+            format_name="team configuration snapshot",
+        )
+        try:
+            team = cls.from_dict(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PersistenceError(
+                f"Invalid team configuration snapshot at {path}: {exc}"
+            ) from exc
         team.config_path = config_path
         return team
+
+
+def _migrate_team_v0(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise TypeError("legacy team configuration root must be a JSON object")
+    return {**data, "schema_version": 1}
 
 
 def resolve_team_dir(team_name: str) -> Path:
