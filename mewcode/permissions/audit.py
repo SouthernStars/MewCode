@@ -6,13 +6,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from mewcode.persistence import PersistenceError, append_jsonl_record, read_jsonl_records
 
 log = logging.getLogger(__name__)
 
@@ -71,11 +72,7 @@ class AuditLogger:
         }
 
         file_path = self._get_current_file()
-        try:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except OSError as e:
-            log.error("[audit] failed to write: %s", e)
+        append_jsonl_record(file_path, entry, format_name="audit log")
 
         # 检查是否需要 rotate
         self._maybe_rotate(file_path)
@@ -111,27 +108,18 @@ class AuditLogger:
         if not file_path.exists():
             return results
 
-        try:
-            with open(file_path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if tool_name and entry.get("tool_name") != tool_name:
-                        continue
-                    if decision and entry.get("decision") != decision:
-                        continue
-                    if source_layer and entry.get("source_layer") != source_layer:
-                        continue
-
-                    results.append(entry)
-        except OSError as e:
-            log.error("[audit] failed to read: %s", e)
+        for entry in read_jsonl_records(file_path, format_name="audit log"):
+            if not isinstance(entry, dict):
+                raise PersistenceError(
+                    f"Invalid audit log record at {file_path}: expected JSON object"
+                )
+            if tool_name and entry.get("tool_name") != tool_name:
+                continue
+            if decision and entry.get("decision") != decision:
+                continue
+            if source_layer and entry.get("source_layer") != source_layer:
+                continue
+            results.append(entry)
 
         return results[offset : offset + limit]
 

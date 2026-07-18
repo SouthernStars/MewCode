@@ -16,6 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mewcode.persistence import (
+    PersistenceError,
+    append_jsonl_record,
+    atomic_write_text,
+    read_jsonl_records,
+)
 from mewcode.workflow.models import AgentCallRecord, JournalEntry
 
 # 单个 journal 文件的大小上限（10 MB）
@@ -140,8 +146,7 @@ class Journal:
             "workflow_name": self._workflow_name,
         }
         line = json.dumps(entry, ensure_ascii=False) + "\n"
-        self._file.write(line)
-        self._file.flush()
+        append_jsonl_record(self._path, entry, format_name="workflow journal")
 
     def update(self, call_id: str, **kwargs: Any) -> None:
         """更新一条已存在的记录（重写整个 journal 文件）。
@@ -250,6 +255,17 @@ class Journal:
     # ------------------------------------------------------------------
 
     def _read_all_raw(self) -> list[dict[str, Any]]:
+        records = read_jsonl_records(self._path, format_name="workflow journal")
+        for record in records:
+            if not isinstance(record, dict):
+                raise PersistenceError(
+                    f"Invalid workflow journal record at {self._path}: "
+                    "expected JSON object"
+                )
+        return records  # type: ignore[return-value]
+
+    """legacy implementation retained below for patch compatibility"""
+    def _read_all_raw_legacy(self) -> list[dict[str, Any]]:
         """读取 journal 文件中所有 JSON 行（容错：跳过损坏行）。"""
         records: list[dict[str, Any]] = []
         if not self._path.exists():
@@ -283,9 +299,10 @@ class Journal:
             self._file.close()
 
         # 写入所有记录
-        with open(self._path, "w", encoding="utf-8") as f:
-            for entry in records:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        content = "".join(
+            json.dumps(entry, ensure_ascii=False) + "\n" for entry in records
+        )
+        atomic_write_text(self._path, content, format_name="workflow journal")
 
         # 重新以追加模式打开
         self._file = open(self._path, "a", encoding="utf-8")

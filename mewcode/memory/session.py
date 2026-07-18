@@ -13,8 +13,10 @@ from mewcode.conversation import ConversationManager, Message, ToolResultBlock, 
 from mewcode.persistence import (
     PersistenceError,
     atomic_write_json,
+    append_jsonl_record,
     file_lock,
     load_versioned_json,
+    read_jsonl_records,
 )
 
 SESSIONS_DIR = ".mewcode/sessions"
@@ -391,8 +393,11 @@ class Session:
     def append(self, message: Message) -> None:
         records = SessionRecord.from_message(message)
         for record in records:
-            self._file.write(record.to_jsonl() + "\n")
-        self._file.flush()
+            append_jsonl_record(
+                self._sessions_dir / f"{self.session_id}.jsonl",
+                json.loads(record.to_jsonl()),
+                format_name="session records",
+            )
 
         self.meta.message_count += 1
         self.meta.last_active = datetime.now(timezone.utc)
@@ -409,8 +414,11 @@ class Session:
         结构性标记而非对话轮次。last_active 仍会更新，以保证 session 按最近
         使用排序。
         """
-        self._file.write(record.to_jsonl() + "\n")
-        self._file.flush()
+        append_jsonl_record(
+            self._sessions_dir / f"{self.session_id}.jsonl",
+            json.loads(record.to_jsonl()),
+            format_name="session records",
+        )
         self.meta.last_active = datetime.now(timezone.utc)
         self.meta.save(self._sessions_dir / f"{self.session_id}.meta")
 
@@ -519,14 +527,15 @@ class SessionManager:
         meta = SessionMeta.load(meta_path)
 
         records: list[SessionRecord] = []
-        with open(jsonl_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = SessionRecord.from_jsonl(line)
-                if record is not None:
-                    records.append(record)
+        for data in read_jsonl_records(jsonl_path, format_name="session records"):
+            if not isinstance(data, dict):
+                raise PersistenceError(
+                    f"Invalid session record at {jsonl_path}: expected JSON object"
+                )
+            record = SessionRecord.from_jsonl(json.dumps(data, ensure_ascii=False))
+            if record is None:
+                raise PersistenceError(f"Invalid session record at {jsonl_path}")
+            records.append(record)
 
         # 重建压缩后的状态：仅从最后一个 compact_boundary 开始重放。
         # 该标记之前的 record 是已被摘要过的原始前缀——保留在磁盘上供审计，
