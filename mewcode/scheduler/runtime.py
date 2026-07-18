@@ -9,10 +9,11 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from mewcode.scheduler.store import CronJob, CronStore
 from mewcode.scheduler.wakeup import WakeupScheduler
+from mewcode.observability import EventType
 from mewcode.task_supervisor import TaskSupervisor
 
 log = logging.getLogger(__name__)
@@ -37,11 +38,13 @@ class SchedulerRuntime:
         *,
         on_fire: Callable[[CronJob], None] | None = None,
         task_supervisor: TaskSupervisor | None = None,
+        event_bus: Any = None,
     ) -> None:
         self._store = cron_store
         self._wakeup = wakeup_scheduler
         self._on_fire = on_fire
         self._task_supervisor = task_supervisor or TaskSupervisor()
+        self._event_bus = event_bus
         self._owns_task_supervisor = task_supervisor is None
         self._task: asyncio.Task | None = None
         self._running = False
@@ -117,6 +120,16 @@ class SchedulerRuntime:
 
             log.info("[scheduler] firing job %s: %s", job.id, job.prompt[:80])
 
+            if self._event_bus is not None:
+                self._event_bus.emit(
+                    EventType.SCHEDULER_TRIGGER,
+                    payload={
+                        "job_id": job.id,
+                        "prompt": job.prompt,
+                        "recurring": job.recurring,
+                    },
+                )
+
             # 标记触发
             self._store.mark_fired(job.id)
 
@@ -137,6 +150,16 @@ class SchedulerRuntime:
             due_wakeups = self._wakeup.get_due(now)
             for wk in due_wakeups:
                 log.info("[scheduler] firing wakeup: %s", wk.reason)
+                if self._event_bus is not None:
+                    self._event_bus.emit(
+                        EventType.SCHEDULER_TRIGGER,
+                        payload={
+                            "job_id": wk.id,
+                            "prompt": wk.prompt,
+                            "reason": wk.reason,
+                            "recurring": False,
+                        },
+                    )
                 self._wakeup.cancel(wk.id)
                 if self._on_fire:
                     try:

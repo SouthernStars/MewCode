@@ -443,6 +443,7 @@ class RuntimeBuilder:
             wakeup_scheduler=wakeup_scheduler,
             on_fire=on_scheduled_fire,
             task_supervisor=task_supervisor,
+            event_bus=event_bus,
         )
         registry.register(CronCreateTool(cron_store))
         registry.register(CronDeleteTool(cron_store))
