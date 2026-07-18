@@ -5,20 +5,21 @@
 
 from __future__ import annotations
 
-import json
-import logging
-import os
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mewcode.persistence import (
+    PersistenceError,
+    atomic_write_json,
+    file_lock,
+    load_versioned_json,
+)
 from mewcode.scheduler.cron import CronExpression
 
-log = logging.getLogger(__name__)
-
 SCHEDULED_TASKS_FILE = ".mewcode/scheduled_tasks.json"
+CRON_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -64,9 +65,9 @@ class CronJob:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CronJob:
         return cls(
-            id=data.get("id", ""),
-            cron=data.get("cron", ""),
-            prompt=data.get("prompt", ""),
+            id=data["id"],
+            cron=data["cron"],
+            prompt=data["prompt"],
             recurring=data.get("recurring", True),
             durable=data.get("durable", False),
             created_at=data.get("created_at", ""),
@@ -180,18 +181,17 @@ class CronStore:
     def _save(self) -> None:
         """保存到磁盘。"""
         durable_jobs = [j for j in self._jobs.values() if j.durable]
-        data = [j.to_dict() for j in durable_jobs]
+        data = {
+            "schema_version": CRON_SCHEMA_VERSION,
+            "jobs": [j.to_dict() for j in durable_jobs],
+        }
 
-        self._file_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self._file_path.with_suffix(".tmp")
-        try:
-            tmp_path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        with file_lock(self._file_path, format_name="cron task snapshot"):
+            atomic_write_json(
+                self._file_path,
+                data,
+                format_name="cron task snapshot",
             )
-            tmp_path.replace(self._file_path)
-        except OSError as e:
-            log.error("[cron] failed to save tasks: %s", e)
 
     def _load(self) -> None:
         """从磁盘加载。"""
@@ -200,29 +200,38 @@ class CronStore:
             self._loaded = True
             return
 
-        try:
-            raw = self._file_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if not isinstance(data, list):
-                raise ValueError("scheduled_tasks.json must be a JSON array")
-        except (json.JSONDecodeError, ValueError) as e:
-            log.error("[cron] failed to parse scheduled tasks: %s", e)
-            # 备份损坏文件
-            corrupt_path = self._file_path.with_suffix(
-                f".json.corrupted.{_now_iso().replace(':', '-')}"
+        data = load_versioned_json(
+            self._file_path,
+            current_version=CRON_SCHEMA_VERSION,
+            migrations={0: _migrate_cron_v0},
+            format_name="cron task snapshot",
+        )
+        jobs = data.get("jobs")
+        if not isinstance(jobs, list):
+            raise PersistenceError(
+                f"Invalid cron task snapshot at {self._file_path}: "
+                "'jobs' must be a JSON array"
             )
-            try:
-                self._file_path.rename(corrupt_path)
-                log.warning("[cron] backed up corrupted file to %s", corrupt_path)
-            except OSError:
-                pass
-            self._jobs = {}
-            self._loaded = True
-            return
 
         self._jobs = {}
-        for item in data:
-            job = CronJob.from_dict(item)
+        for index, item in enumerate(jobs):
+            if not isinstance(item, dict):
+                raise PersistenceError(
+                    f"Invalid cron task snapshot at {self._file_path}: "
+                    f"jobs[{index}] must be a JSON object"
+                )
+            try:
+                job = CronJob.from_dict(item)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PersistenceError(
+                    f"Invalid cron task snapshot at {self._file_path}: "
+                    f"jobs[{index}] is invalid: {exc}"
+                ) from exc
+            if job.id in self._jobs:
+                raise PersistenceError(
+                    f"Invalid cron task snapshot at {self._file_path}: "
+                    f"duplicate job id {job.id!r}"
+                )
             self._jobs[job.id] = job
 
         self._loaded = True
@@ -246,12 +255,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _migrate_cron_v0(data: Any) -> dict[str, Any]:
+    if not isinstance(data, list):
+        raise TypeError("legacy cron task snapshot root must be a JSON array")
+    return {"schema_version": 1, "jobs": data}
+
+
 def _parse_iso(iso_str: str) -> datetime:
     """解析 ISO 时间字符串。"""
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except (ValueError, TypeError):
-        return datetime.now(timezone.utc)
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt

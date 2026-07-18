@@ -10,10 +10,17 @@ from pathlib import Path
 from typing import IO, Any
 
 from mewcode.conversation import ConversationManager, Message, ToolResultBlock, ToolUseBlock
+from mewcode.persistence import (
+    PersistenceError,
+    atomic_write_json,
+    file_lock,
+    load_versioned_json,
+)
 
 SESSIONS_DIR = ".mewcode/sessions"
 DEFAULT_MAX_AGE_DAYS = 30
 TITLE_MAX_LENGTH = 50
+SESSION_META_SCHEMA_VERSION = 1
 
 SESSION_SUMMARY_PROMPT = (
     "你是一个对话摘要助手。请根据下面的对话内容，用一句话总结这个会话的主要内容。"
@@ -309,6 +316,12 @@ def validate_message_chain(records: list[SessionRecord]) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _migrate_session_meta_v0(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise TypeError("legacy session metadata root must be a JSON object")
+    return {**data, "schema_version": 1}
+
+
 @dataclass
 class SessionMeta:
     id: str
@@ -321,6 +334,7 @@ class SessionMeta:
 
     def save(self, path: Path) -> None:
         data = {
+            "schema_version": SESSION_META_SCHEMA_VERSION,
             "id": self.id,
             "title": self.title,
             "summary": self.summary,
@@ -329,14 +343,18 @@ class SessionMeta:
             "created_at": self.created_at.isoformat(),
             "last_active": self.last_active.isoformat(),
         }
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        with file_lock(path, format_name="session metadata"):
+            atomic_write_json(path, data, format_name="session metadata")
 
     @classmethod
-    def load(cls, path: Path) -> SessionMeta | None:
+    def load(cls, path: Path) -> SessionMeta:
+        data = load_versioned_json(
+            path,
+            current_version=SESSION_META_SCHEMA_VERSION,
+            migrations={0: _migrate_session_meta_v0},
+            format_name="session metadata",
+        )
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
             return cls(
                 id=data["id"],
                 title=data.get("title", ""),
@@ -346,8 +364,10 @@ class SessionMeta:
                 created_at=datetime.fromisoformat(data["created_at"]),
                 last_active=datetime.fromisoformat(data["last_active"]),
             )
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return None
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PersistenceError(
+                f"Invalid session metadata at {path}: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +505,7 @@ class SessionManager:
     def list(self) -> list[SessionMeta]:
         metas: list[SessionMeta] = []
         for meta_path in self._sessions_dir.glob("*.meta"):
-            meta = SessionMeta.load(meta_path)
-            if meta is not None:
-                metas.append(meta)
+            metas.append(SessionMeta.load(meta_path))
         metas.sort(key=lambda m: m.last_active, reverse=True)
         return metas
 
@@ -499,8 +517,6 @@ class SessionManager:
             return None
 
         meta = SessionMeta.load(meta_path)
-        if meta is None:
-            return None
 
         records: list[SessionRecord] = []
         with open(jsonl_path, encoding="utf-8") as f:
@@ -560,7 +576,7 @@ class SessionManager:
 
         for meta_path in list(self._sessions_dir.glob("*.meta")):
             meta = SessionMeta.load(meta_path)
-            if meta is not None and meta.last_active < cutoff:
+            if meta.last_active < cutoff:
                 self.delete(meta.id)
                 removed += 1
 

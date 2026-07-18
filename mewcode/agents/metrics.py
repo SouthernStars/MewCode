@@ -5,16 +5,23 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mewcode.persistence import (
+    PersistenceError,
+    atomic_write_json,
+    file_lock,
+    load_versioned_json,
+)
+
 log = logging.getLogger(__name__)
 
 METRICS_DIR = ".mewcode/metrics"
+METRICS_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -101,6 +108,24 @@ class SessionMetrics:
             "tokens_per_second": round(self.tokens_per_second, 2),
         }
 
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "schema_version": METRICS_SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "total_tokens": self.total_tokens,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tool_calls": self.total_tool_calls,
+            "total_agent_calls": self.total_agent_calls,
+            "tool_latencies": self.tool_latencies,
+            "prompt_cache_hits": self.prompt_cache_hits,
+            "prompt_cache_misses": self.prompt_cache_misses,
+            "total_requests": self.total_requests,
+            "compact_count": self.compact_count,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+        }
+
 
 class MetricsCollector:
     """会话级性能指标收集器。"""
@@ -153,13 +178,21 @@ class MetricsCollector:
 
         file_path = metrics_dir / f"{self._metrics.session_id}.json"
         try:
-            file_path.write_text(
-                json.dumps(self._metrics.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            with file_lock(file_path, format_name="metrics snapshot"):
+                atomic_write_json(
+                    file_path,
+                    self._metrics.to_snapshot(),
+                    format_name="metrics snapshot",
+                )
             log.info("[metrics] saved to %s", file_path)
-        except OSError as e:
-            log.error("[metrics] failed to save: %s", e)
+        except PersistenceError as exc:
+            log.error(
+                "[metrics] failed to save session_id=%s path=%s reason=%s",
+                self._metrics.session_id,
+                file_path,
+                exc,
+                exc_info=True,
+            )
 
     @classmethod
     def load(cls, work_dir: str, session_id: str) -> SessionMetrics | None:
@@ -167,15 +200,89 @@ class MetricsCollector:
         file_path = Path(work_dir) / METRICS_DIR / f"{session_id}.json"
         if not file_path.exists():
             return None
+        data = load_versioned_json(
+            file_path,
+            current_version=METRICS_SCHEMA_VERSION,
+            migrations={0: _migrate_metrics_v0},
+            format_name="metrics snapshot",
+        )
         try:
-            data = json.loads(file_path.read_text(encoding="utf-8"))
-            m = SessionMetrics(session_id=data.get("session_id", ""))
-            m.total_tokens = data.get("total_tokens", 0)
-            m.total_input_tokens = data.get("total_input_tokens", 0)
-            m.total_output_tokens = data.get("total_output_tokens", 0)
-            m.total_tool_calls = data.get("total_tool_calls", 0)
-            m.total_agent_calls = data.get("total_agent_calls", 0)
-            m.compact_count = data.get("compact_count", 0)
-            return m
-        except (json.JSONDecodeError, KeyError, OSError):
-            return None
+            return _metrics_from_snapshot(data)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PersistenceError(
+                f"Invalid metrics snapshot at {file_path}: {exc}"
+            ) from exc
+
+
+def _migrate_metrics_v0(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise TypeError("legacy metrics snapshot root must be a JSON object")
+    defaults = {
+        "session_id": "",
+        "total_tokens": 0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_tool_calls": 0,
+        "total_agent_calls": 0,
+        "tool_latencies": [],
+        "prompt_cache_hits": 0,
+        "prompt_cache_misses": 0,
+        "total_requests": 0,
+        "compact_count": 0,
+        "started_at": 0.0,
+        "ended_at": 0.0,
+    }
+    return {**defaults, **data, "schema_version": 1}
+
+
+def _metrics_from_snapshot(data: dict[str, Any]) -> SessionMetrics:
+    integer_fields = (
+        "total_tokens",
+        "total_input_tokens",
+        "total_output_tokens",
+        "total_tool_calls",
+        "total_agent_calls",
+        "prompt_cache_hits",
+        "prompt_cache_misses",
+        "total_requests",
+        "compact_count",
+    )
+    for field_name in integer_fields:
+        value = data[field_name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{field_name} must be an integer, got {value!r}")
+
+    session_id = data["session_id"]
+    if not isinstance(session_id, str):
+        raise TypeError(f"session_id must be a string, got {session_id!r}")
+
+    tool_latencies = data["tool_latencies"]
+    if not isinstance(tool_latencies, list) or any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in tool_latencies
+    ):
+        raise TypeError("tool_latencies must be an array of numbers")
+
+    started_at = data["started_at"]
+    ended_at = data["ended_at"]
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in (started_at, ended_at)
+    ):
+        raise TypeError("started_at and ended_at must be numbers")
+
+    return SessionMetrics(
+        session_id=session_id,
+        total_tokens=data["total_tokens"],
+        total_input_tokens=data["total_input_tokens"],
+        total_output_tokens=data["total_output_tokens"],
+        total_tool_calls=data["total_tool_calls"],
+        total_agent_calls=data["total_agent_calls"],
+        tool_latencies=[float(value) for value in tool_latencies],
+        prompt_cache_hits=data["prompt_cache_hits"],
+        prompt_cache_misses=data["prompt_cache_misses"],
+        total_requests=data["total_requests"],
+        compact_count=data["compact_count"],
+        started_at=float(started_at),
+        ended_at=float(ended_at),
+    )
