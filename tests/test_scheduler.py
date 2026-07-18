@@ -9,6 +9,7 @@ from mewcode.scheduler.cron import CronExpression, CronParseError
 from mewcode.scheduler.runtime import SchedulerRuntime
 from mewcode.scheduler.store import CronJob, CronStore
 from mewcode.scheduler.wakeup import WakeupScheduler
+from mewcode.observability import EventType, RuntimeEventBus
 
 
 def test_cron_parsing_and_next_fire() -> None:
@@ -93,7 +94,15 @@ async def test_runtime_fires_cron_and_wakeup(tmp_path: Path) -> None:
     wakeups = WakeupScheduler()
     wakeup = wakeups.schedule(60, "check", "wakeup prompt")
     fired = []
-    runtime = SchedulerRuntime(store, wakeups, on_fire=fired.append)
+    events = []
+    event_bus = RuntimeEventBus()
+    event_bus.subscribe(events.append)
+    runtime = SchedulerRuntime(
+        store,
+        wakeups,
+        on_fire=fired.append,
+        event_bus=event_bus,
+    )
 
     with patch.object(store, "get_due", return_value=[cron_job]), patch.object(
         wakeups, "get_due", return_value=[wakeup]
@@ -102,6 +111,10 @@ async def test_runtime_fires_cron_and_wakeup(tmp_path: Path) -> None:
 
     assert [job.prompt for job in fired] == ["cron prompt", "wakeup prompt"]
     assert wakeups.list_all() == []
+    assert [event.event_type for event in events] == [
+        EventType.SCHEDULER_TRIGGER,
+        EventType.SCHEDULER_TRIGGER,
+    ]
 
 
 @pytest.mark.asyncio
