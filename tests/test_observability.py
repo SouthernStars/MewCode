@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from mewcode.observability import (
+    EventType,
+    JsonlEventSink,
+    RuntimeEvent,
+    RuntimeEventBus,
+)
+from mewcode.persistence import read_jsonl_records
+
+
+def test_runtime_event_has_causal_context_and_round_trips() -> None:
+    event = RuntimeEvent(
+        event_type=EventType.TOOL_CALL,
+        session_id="session-1",
+        run_id="run-1",
+        agent_id="agent-1",
+        parent_agent_id="parent-1",
+        tool_call_id="tool-1",
+        timestamp=123.0,
+        event_id="event-1",
+        payload={"tool_name": "Read"},
+    )
+
+    assert RuntimeEvent.from_dict(event.to_dict()) == event
+
+
+def test_event_bus_preserves_order_and_unsubscribes() -> None:
+    events: list[RuntimeEvent] = []
+    bus = RuntimeEventBus()
+    unsubscribe = bus.subscribe(events.append)
+
+    bus.emit(EventType.LLM_REQUEST, payload={"iteration": 1})
+    unsubscribe()
+    bus.emit(EventType.LLM_RESPONSE, payload={"iteration": 1})
+
+    assert [event.event_type for event in events] == [EventType.LLM_REQUEST]
+
+
+def test_event_bus_isolates_optional_sink_failures() -> None:
+    seen: list[RuntimeEvent] = []
+    bus = RuntimeEventBus()
+    bus.subscribe(lambda _event: (_ for _ in ()).throw(RuntimeError("sink down")))
+    bus.subscribe(seen.append)
+
+    bus.emit(EventType.ERROR, payload={"message": "boom"})
+
+    assert len(seen) == 1
+
+
+def test_jsonl_event_sink_persists_events(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    sink = JsonlEventSink(str(path))
+    event = RuntimeEvent(event_type=EventType.WORKFLOW_STAGE, payload={"stage": "plan"})
+
+    sink(event)
+
+    assert read_jsonl_records(path, format_name="runtime events") == [event.to_dict()]
