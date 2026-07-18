@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 
 from mewcode.workflow.context import BudgetExhaustedError, WorkflowContext
-from mewcode.workflow.engine import WorkflowEngine, WorkflowNotFoundError
+from mewcode.workflow.engine import (
+    WorkflowEngine,
+    WorkflowNotFoundError,
+    WorkflowTimeoutError,
+)
 from mewcode.workflow.journal import Journal
 from mewcode.workflow.models import AgentCallRecord, BudgetInfo
 
@@ -126,3 +130,42 @@ async def test_pipeline_parallel_and_budget_failure(tmp_path: Path) -> None:
 async def test_missing_workflow_fails_clearly(tmp_path: Path) -> None:
     with pytest.raises(WorkflowNotFoundError, match="not found"):
         await WorkflowEngine(str(tmp_path)).execute("missing")
+
+
+@pytest.mark.asyncio
+async def test_workflow_timeout_marks_run_interrupted(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        "slow",
+        "import asyncio\n"
+        "async def run(ctx):\n"
+        "    await asyncio.sleep(10)\n",
+    )
+
+    engine = WorkflowEngine(str(tmp_path))
+    with pytest.raises(WorkflowTimeoutError, match="exceeded timeout"):
+        await engine.execute("slow", resume=False, timeout_seconds=0.01)
+
+    assert engine.get_active_runs()[0].status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_context_agent_timeout_cancels_factory(tmp_path: Path) -> None:
+    journal = Journal.create(str(tmp_path), "timeout", "run-1")
+
+    async def agent_factory(**_kwargs):
+        import asyncio
+
+        await asyncio.sleep(10)
+        return "never", {}
+
+    context = WorkflowContext(
+        workflow_name="timeout",
+        run_id="run-1",
+        journal=journal,
+        agent_factory=agent_factory,
+    )
+
+    with pytest.raises(TimeoutError):
+        await context.agent("slow", timeout_seconds=0.01)
+    journal.close()

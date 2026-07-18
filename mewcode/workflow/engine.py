@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -31,6 +32,10 @@ class WorkflowNotFoundError(WorkflowError):
     """Workflow 未找到。"""
 
     pass
+
+
+class WorkflowTimeoutError(WorkflowError):
+    """A workflow exceeded its explicit execution timeout."""
 
 
 class WorkflowEngine:
@@ -167,6 +172,7 @@ class WorkflowEngine:
         *,
         budget_total: int | None = None,
         resume: bool = True,
+        timeout_seconds: float | None = None,
     ) -> Any:
         """执行指定 workflow。
 
@@ -261,10 +267,27 @@ class WorkflowEngine:
 
         # 执行
         try:
-            result = await entry_fn(ctx, args) if args is not None else await entry_fn(ctx)
+            execution = entry_fn(ctx, args) if args is not None else entry_fn(ctx)
+            result = (
+                await asyncio.wait_for(execution, timeout_seconds)
+                if timeout_seconds is not None
+                else await execution
+            )
             state.status = "completed"
             state.completed_at = _now_iso()
             return result
+        except asyncio.TimeoutError as exc:
+            state.status = "interrupted"
+            state.completed_at = _now_iso()
+            raise WorkflowTimeoutError(
+                f"Workflow '{workflow_name}' exceeded timeout "
+                f"of {timeout_seconds}s",
+                workflow_name=workflow_name,
+            ) from exc
+        except asyncio.CancelledError:
+            state.status = "interrupted"
+            state.completed_at = _now_iso()
+            raise
         except BudgetExhaustedError:
             state.status = "interrupted"
             state.completed_at = _now_iso()

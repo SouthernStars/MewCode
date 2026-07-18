@@ -24,6 +24,7 @@ from pydantic import BaseModel, ValidationError
 from mewcode.workflow.journal import Journal
 from mewcode.workflow.models import AgentCallRecord, BudgetInfo, StructuredOutputConfig
 from mewcode.execution_context import ExecutionContext
+from mewcode.observability import EventType
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ class WorkflowContext:
         model: str | None = None,
         effort: str | None = None,
         isolation: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Any:
         """执行一次 Agent 调用。
 
@@ -216,12 +218,17 @@ class WorkflowContext:
                         "agent_factory is not set — workflow engine must provide it"
                     )
 
-                result_text, usage = await self._agent_factory(
+                execution = self._agent_factory(
                     prompt=prompt,
                     schema=schema,
                     model=model,
                     effort=effort,
                     isolation=isolation,
+                )
+                result_text, usage = (
+                    await asyncio.wait_for(execution, timeout_seconds)
+                    if timeout_seconds is not None
+                    else await execution
                 )
         except Exception as e:
             # 更新记录为 failed
@@ -358,6 +365,14 @@ class WorkflowContext:
         之后发起的 agent() 调用自动归属此 phase。
         """
         self._phase.title = title
+        if self.execution_context and self.execution_context.event_bus:
+            self.execution_context.event_bus.emit(
+                EventType.WORKFLOW_STAGE,
+                session_id=self.execution_context.session_id,
+                run_id=self._run_id,
+                agent_id=self.execution_context.agent_id,
+                payload={"workflow": self._workflow_name, "phase": title},
+            )
         if self._on_phase_change:
             self._on_phase_change(title)
 
