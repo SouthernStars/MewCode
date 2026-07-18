@@ -16,7 +16,7 @@ from mewcode.workflow.models import (
 )
 from mewcode.workflow.journal import Journal
 from mewcode.workflow.context import WorkflowContext
-from mewcode.workflow.engine import WorkflowEngine
+from mewcode.workflow.engine import WorkflowEngine, WorkflowTimeoutError
 
 __all__ = [
     "WorkflowDef",
@@ -27,4 +27,5 @@ __all__ = [
     "Journal",
     "WorkflowContext",
     "WorkflowEngine",
+    "WorkflowTimeoutError",
 ]
