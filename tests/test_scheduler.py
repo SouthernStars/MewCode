@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -49,6 +50,39 @@ def test_store_persists_durable_jobs_and_detects_due_jobs(tmp_path: Path) -> Non
     assert [job.id for job in store.get_due(now)] == ["due"]
     restored = CronStore(str(tmp_path))
     assert {job.id for job in restored.list()} == {"due", "future"}
+
+    snapshot = json.loads(
+        (tmp_path / ".mewcode" / "scheduled_tasks.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert snapshot["schema_version"] == 1
+    assert {job["id"] for job in snapshot["jobs"]} == {"due", "future"}
+
+
+def test_store_migrates_legacy_array_and_rejects_corruption(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".mewcode" / "scheduled_tasks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "legacy",
+                    "cron": "* * * * *",
+                    "prompt": "run",
+                    "durable": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert CronStore(str(tmp_path)).get("legacy") is not None
+
+    path.write_text("not json", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="cron task snapshot"):
+        CronStore(str(tmp_path)).list()
 
 
 @pytest.mark.asyncio

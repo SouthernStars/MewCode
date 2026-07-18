@@ -566,10 +566,25 @@ class TestSessionMeta:
         assert loaded.title == "Test session"
         assert loaded.message_count == 10
 
-    def test_load_invalid_returns_none(self, tmp_path: Path) -> None:
+    def test_load_invalid_fails_clearly(self, tmp_path: Path) -> None:
         path = tmp_path / "bad.meta"
         path.write_text("not json", encoding="utf-8")
-        assert SessionMeta.load(path) is None
+        with pytest.raises(RuntimeError, match="session metadata"):
+            SessionMeta.load(path)
+
+    def test_save_adds_schema_version_and_load_migrates_v0(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        meta = SessionMeta(id="versioned")
+        path = tmp_path / "versioned.meta"
+        meta.save(path)
+        assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 1
+
+        legacy = json.loads(path.read_text(encoding="utf-8"))
+        legacy.pop("schema_version")
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        assert SessionMeta.load(path).id == "versioned"
 
 # =========================================================================
 # G. 记忆管理器 MemoryManager
