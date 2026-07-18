@@ -31,7 +31,11 @@ from mewcode.harness.tools import (
 )
 from mewcode.hooks import HookContext, HookEngine
 from mewcode.mcp import MCPManager
-from mewcode.observability import JsonlEventSink, RuntimeEventBus
+from mewcode.observability import (
+    EventMetricsAggregator,
+    JsonlEventSink,
+    RuntimeEventBus,
+)
 from mewcode.memory import MemoryManager, Session, SessionManager, load_instructions
 from mewcode.permissions import (
     DangerousCommandDetector,
@@ -105,6 +109,7 @@ class Runtime:
     task_manager: TaskManager
     trace_manager: TraceManager
     event_bus: RuntimeEventBus
+    event_metrics: EventMetricsAggregator
     skill_loader: SkillLoader
     skill_executor: SkillExecutor
     load_skill_tool: LoadSkill
@@ -229,6 +234,12 @@ class Runtime:
             )
 
         await self.task_supervisor.shutdown()
+        self.event_metrics.save(
+            Path(self.work_dir)
+            / ".mewcode"
+            / "metrics"
+            / f"{self.session.session_id}.events.json"
+        )
         self.session.close()
         self._started = False
 
@@ -342,6 +353,8 @@ class RuntimeBuilder:
 
         task_manager = TaskManager(task_supervisor=task_supervisor)
         event_bus = RuntimeEventBus()
+        event_metrics = EventMetricsAggregator(session_id=session.session_id)
+        event_bus.subscribe(event_metrics)
         event_bus.subscribe(
             JsonlEventSink(
                 str(Path(self.work_dir) / ".mewcode" / "events" / f"{session.session_id}.jsonl")
@@ -508,6 +521,7 @@ class RuntimeBuilder:
             task_manager=task_manager,
             trace_manager=trace_manager,
             event_bus=event_bus,
+            event_metrics=event_metrics,
             skill_loader=skill_loader,
             skill_executor=skill_executor,
             load_skill_tool=load_skill_tool,
