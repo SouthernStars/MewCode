@@ -190,7 +190,9 @@ async def test_bash_timeout_kills_descendant_process(tmp_path: Path) -> None:
                     str(script),
                     str(pid_file),
                 ),
-                timeout=1,
+                # Leave enough startup budget for the runner, shell, and two
+                # Python processes on loaded Windows CI hosts.
+                timeout=5,
             )
         )
         assert result.is_error
