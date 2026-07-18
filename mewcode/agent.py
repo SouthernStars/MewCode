@@ -35,6 +35,7 @@ from mewcode.permissions import (
     PermissionChecker,
     PermissionMode,
 )
+from mewcode.execution_context import ExecutionContext
 from mewcode.hooks import HookContext, HookEngine
 from mewcode.prompts import build_environment_context, build_plan_mode_reminder, build_system_prompt
 from mewcode.tools import ToolRegistry
@@ -294,6 +295,7 @@ class Agent:
         metrics_collector: Any = None,
         task_supervisor: TaskSupervisor | None = None,
         event_bus: RuntimeEventBus | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> None:
         self.client = client
         self.protocol = protocol
@@ -351,6 +353,7 @@ class Agent:
         self.rate_limiter = rate_limiter
         self.metrics_collector = metrics_collector
         self.event_bus = event_bus
+        self.execution_context = execution_context
 
     def _emit_runtime_event(
         self,

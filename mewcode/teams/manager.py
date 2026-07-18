@@ -18,6 +18,7 @@ from mewcode.teams.progress import TeammateProgress
 from mewcode.teams.registry import AgentNameRegistry
 from mewcode.teams.shared_task import SharedTaskStore
 from mewcode.teams.spawn_inprocess import InProcessTeammateHandle
+from mewcode.execution_context import ExecutionContext
 
 if TYPE_CHECKING:
     from mewcode.agent import Agent
@@ -30,7 +31,12 @@ class TeamError(Exception):
 
 
 class TeamManager:
-    def __init__(self, worktree_manager: Any = None, trace_manager: Any = None) -> None:
+    def __init__(
+        self,
+        worktree_manager: Any = None,
+        trace_manager: Any = None,
+        execution_context: ExecutionContext | None = None,
+    ) -> None:
         self._teams: dict[str, AgentTeam] = {}
         self._task_stores: dict[str, SharedTaskStore] = {}
         self._mailboxes: dict[str, Mailbox] = {}
@@ -39,6 +45,7 @@ class TeamManager:
         self._detected_backend: BackendType | None = None
         self._worktree_manager = worktree_manager
         self._trace_manager = trace_manager
+        self.execution_context = execution_context
         self._teammate_team_map: dict[str, str] = {}  # agent_id -> team_name
 
     def detect_backend(

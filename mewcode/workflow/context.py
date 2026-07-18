@@ -23,6 +23,7 @@ from pydantic import BaseModel, ValidationError
 
 from mewcode.workflow.journal import Journal
 from mewcode.workflow.models import AgentCallRecord, BudgetInfo, StructuredOutputConfig
+from mewcode.execution_context import ExecutionContext
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class WorkflowContext:
         on_phase_change: Callable[[str], None] | None = None,
         on_agent_start: Callable[[str, str], None] | None = None,
         on_agent_complete: Callable[[str, str], None] | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> None:
         self._workflow_name = workflow_name
         self._run_id = run_id
@@ -76,6 +78,7 @@ class WorkflowContext:
         self._on_phase_change = on_phase_change
         self._on_agent_start = on_agent_start
         self._on_agent_complete = on_agent_complete
+        self.execution_context = execution_context
 
         self._phase = _PhaseState()
         self._semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)

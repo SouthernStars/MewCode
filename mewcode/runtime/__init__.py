@@ -8,6 +8,7 @@ from mewcode.runtime.config import (
     RuntimeSettings,
 )
 from mewcode.task_supervisor import TaskSupervisor
+from mewcode.execution_context import ExecutionContext
 
 __all__ = [
     "Runtime",
@@ -20,4 +21,5 @@ __all__ = [
     "RuntimeProviderSettings",
     "RuntimeSettings",
     "TaskSupervisor",
+    "ExecutionContext",
 ]

@@ -12,6 +12,7 @@ from typing import Any, Callable
 from mewcode.workflow.context import BudgetExhaustedError, WorkflowContext
 from mewcode.workflow.journal import JOURNALS_DIR, Journal
 from mewcode.workflow.models import BudgetInfo, WorkflowDef, WorkflowState
+from mewcode.execution_context import ExecutionContext
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class WorkflowEngine:
         on_phase_change: Callable[[str], None] | None = None,
         on_agent_start: Callable[[str, str], None] | None = None,
         on_agent_complete: Callable[[str, str], None] | None = None,
+        execution_context: ExecutionContext | None = None,
     ) -> None:
         self._work_dir = work_dir
         self._agent_factory = agent_factory
@@ -58,6 +60,7 @@ class WorkflowEngine:
         self._on_phase_change = on_phase_change
         self._on_agent_start = on_agent_start
         self._on_agent_complete = on_agent_complete
+        self._execution_context = execution_context
 
         self._active_runs: dict[str, WorkflowState] = {}
 
@@ -244,6 +247,7 @@ class WorkflowEngine:
             on_phase_change=self._on_phase_change,
             on_agent_start=self._on_agent_start,
             on_agent_complete=self._on_agent_complete,
+            execution_context=self._execution_context,
         )
 
         # 追踪状态
