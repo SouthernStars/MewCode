@@ -5,11 +5,24 @@ import asyncio
 import logging
 import os
 import sys
+import shutil
+import platform
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 
 from mewcode.config import ConfigError, load_config
 from mewcode.hooks import HookConfigError, HookEngine, load_hooks
 from mewcode.permissions import PermissionMode
+
+PROJECT_CONFIG = """# MewCode project configuration
+permission_mode: default
+providers:
+  - name: default
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-3-5-sonnet-latest
+    api_key: ${ANTHROPIC_API_KEY}
+"""
 
 
 def main() -> None:
@@ -35,7 +48,22 @@ def main() -> None:
         default=None,
         help="Run non-interactively: execute the prompt and print the result to stdout",
     )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("init", "doctor", "version"),
+        help="Project maintenance command",
+    )
     args = parser.parse_args()
+
+    if args.command == "version":
+        print(_version())
+        return
+    if args.command == "init":
+        _init_project(Path.cwd())
+        return
+    if args.command == "doctor":
+        raise SystemExit(_doctor(Path.cwd()))
 
     try:
         config = load_config()
@@ -68,6 +96,52 @@ def main() -> None:
         driver_class=NoAltScreenDriver,
     )
     app.run()
+
+
+def _version() -> str:
+    try:
+        return package_version("mewcode")
+    except PackageNotFoundError:
+        return "0.2.0"
+
+
+def _init_project(root: Path) -> None:
+    config_dir = root / ".mewcode"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "config.yaml"
+    if config_path.exists():
+        print(f"配置已存在：{config_path}")
+    else:
+        config_path.write_text(PROJECT_CONFIG, encoding="utf-8")
+        print(f"已创建：{config_path}")
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(".mewcode/debug.log\n.mewcode/sessions/\n", encoding="utf-8")
+        print(f"已创建：{gitignore}")
+
+
+def _doctor(root: Path) -> int:
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(("Python", sys.version_info >= (3, 11), platform.python_version()))
+    checks.append(("Git", shutil.which("git") is not None, "可用"))
+    config_path = root / ".mewcode" / "config.yaml"
+    checks.append(("配置文件", config_path.exists(), str(config_path)))
+    try:
+        config = load_config(config_path)
+    except (ConfigError, OSError) as exc:
+        checks.append(("配置校验", False, str(exc)))
+    else:
+        checks.append(("Provider", bool(config.providers), f"{len(config.providers)} 个"))
+        for provider in config.providers:
+            key = provider.resolve_api_key()
+            key_ok = bool(key) and not key.startswith("${")
+            checks.append((f"API Key/{provider.name}", key_ok, "已设置" if key_ok else "未设置"))
+
+    failed = 0
+    for name, ok, detail in checks:
+        print(f"[{'OK' if ok else 'FAIL'}] {name}: {detail}")
+        failed += not ok
+    return 1 if failed else 0
 
 
 async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None:
