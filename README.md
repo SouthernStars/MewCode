@@ -596,6 +596,16 @@ uv run mewcode
 uv run pytest
 ```
 
+## Deterministic Eval Demo
+
+```bash
+python scripts/run_deterministic_eval.py
+```
+
+This offline demo uses fixed observations rather than a real model. It verifies
+four representative scenarios, tool constraints, and token budgets. The
+reproducible report is documented in [docs/eval-baseline.md](docs/eval-baseline.md).
+
 ## License
 
 [MIT](LICENSE)
