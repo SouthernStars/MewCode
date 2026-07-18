@@ -13,6 +13,7 @@ from mewcode.agents.task_manager import TaskManager
 from mewcode.agents.trace import TraceManager
 from mewcode.cache import FileCache
 from mewcode.client import LLMClient, create_client, resolve_context_window
+from mewcode.execution_context import ExecutionContext
 from mewcode.config import ProviderConfig
 from mewcode.context.critic import CompletenessCritic
 from mewcode.conversation import ConversationManager
@@ -362,6 +363,16 @@ class RuntimeBuilder:
         )
         agent.event_bus = event_bus
         trace_manager = TraceManager()
+        execution_context = ExecutionContext(
+            work_dir=self.work_dir,
+            session_id=session.session_id,
+            agent_id=agent.agent_id,
+            task_supervisor=task_supervisor,
+            event_bus=event_bus,
+            trace_manager=trace_manager,
+            permission_checker=checker,
+        )
+        agent.execution_context = execution_context
         agent_loader = AgentLoader(
             self.work_dir,
             enable_verification=self.settings.enable_verification_agent,
@@ -370,6 +381,7 @@ class RuntimeBuilder:
         team_manager = TeamManager(
             worktree_manager=worktree_manager,
             trace_manager=trace_manager,
+            execution_context=execution_context,
         )
         registry.register(
             AgentTool(
@@ -406,6 +418,7 @@ class RuntimeBuilder:
         workflow_engine = WorkflowEngine(
             work_dir=self.work_dir,
             on_log=self.callbacks.on_workflow_log,
+            execution_context=execution_context,
         )
         registry.register(
             WorkflowTool(
